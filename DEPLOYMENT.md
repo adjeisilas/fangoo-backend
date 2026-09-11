@@ -78,6 +78,89 @@ serves fine and every visitor's browser calls their own machine.
 
 ---
 
+## Deploying to Railway
+
+Three services in one Railway project. Do them in this order — each needs the
+one before it.
+
+### 1. PostgreSQL
+
+New Project → **Add PostgreSQL**. Railway generates `DATABASE_URL` for you.
+Reference it from the API service as `${{Postgres.DATABASE_URL}}` rather than
+copying the value, so a credential rotation does not silently break the API.
+
+### 2. API service
+
+New Service → **GitHub Repo** → `fangoo-backend`. Railway detects the
+Dockerfile. Then set variables:
+
+```
+NODE_ENV              production
+DATABASE_URL          ${{Postgres.DATABASE_URL}}
+JWT_ACCESS_SECRET     <generate>
+JWT_REFRESH_SECRET    <generate, different>
+PAYSTACK_SECRET_KEY   sk_live_...
+PAYSTACK_PUBLIC_KEY   pk_live_...
+PAYSTACK_CURRENCY     GHS
+CORS_ORIGIN           https://<web-domain>          # fill in after step 3
+PAYSTACK_CALLBACK_URL https://<web-domain>/orders/payment-callback
+```
+
+Generate → **Public Domain**. Note the hostname; the web service needs it.
+
+The container runs `prisma migrate deploy` before serving, so the schema is
+created on first boot. If the API crash-loops, read the logs: the boot
+validator names exactly which variable is wrong.
+
+### 3. Web service
+
+New Service → **GitHub Repo** → `fangoo-frontend`. Set **both** as variables
+*and* as build arguments — Nuxt embeds them in the client bundle at build time,
+so setting them only at runtime leaves the browser calling whatever the build
+used:
+
+```
+NODE_ENV              production
+NUXT_PUBLIC_API_BASE  https://<api-domain>/api/v1
+NUXT_PUBLIC_SITE_URL  https://<web-domain>
+```
+
+Generate → **Public Domain**, then go back and fill `CORS_ORIGIN` and
+`PAYSTACK_CALLBACK_URL` on the API with this hostname, and redeploy the API.
+
+### 4. Paystack webhook
+
+Paystack dashboard → Settings → API Keys & Webhooks → Webhook URL:
+
+```
+https://<api-domain>/api/v1/payments/webhook
+```
+
+This matters more than it looks. Until it is set, a payment is only confirmed
+when the buyer returns through the callback page — so anyone who pays and closes
+the tab leaves their order stuck in `PAYMENT_PENDING` with their money taken.
+
+### 5. Your own admin account
+
+Register through the site, then promote yourself. Railway's Postgres plugin has
+a query console:
+
+```sql
+UPDATE users SET role = 'ADMIN' WHERE email = 'you@example.com';
+```
+
+There is deliberately no way to create an admin through the API.
+
+### Moving to a real domain later
+
+Add it in Railway, then update `NUXT_PUBLIC_SITE_URL`, `CORS_ORIGIN` and
+`PAYSTACK_CALLBACK_URL`, and **redeploy the web service** — `NUXT_PUBLIC_SITE_URL`
+is baked into the build, so a restart alone will not pick it up. Check
+`https://<domain>/robots.txt` afterwards: if it still advertises the old origin,
+the rebuild did not happen.
+
+---
+
 ## Local production parity
 
 `docker-compose.yml` lives in this repo and builds the web image from the
@@ -121,7 +204,10 @@ developer's existing database fails there rather than on release day.
 - [ ] `PAYSTACK_SECRET_KEY` is `sk_live_`
 - [ ] `PAYSTACK_CALLBACK_URL` points at the real web domain
 - [ ] `CORS_ORIGIN` lists the real web origin, no wildcard
-- [ ] `NUXT_PUBLIC_API_BASE` and `NUXT_PUBLIC_SITE_URL` set **at build time**
+- [ ] `NUXT_PUBLIC_API_BASE` and `NUXT_PUBLIC_SITE_URL` set **at build time**,
+      and `NUXT_PUBLIC_SITE_URL` is the origin visitors actually use — the
+      default is localhost precisely so an unset value cannot quietly advertise
+      someone else's domain
 - [ ] Database reachable only from the API, not the internet
 - [ ] TLS on both public hostnames — the API sends HSTS in production
 - [ ] Paystack webhook configured to `https://<api>/api/v1/payments/webhook`
