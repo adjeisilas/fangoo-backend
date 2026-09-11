@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A second push to the same branch makes the first run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    # Unit tests mock Prisma, but the migrations are checked against a real
+    # database below — that is the part a mock cannot tell you is broken.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: fangoo
+          POSTGRES_PASSWORD: fangoo
+          POSTGRES_DB: fangoo_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U fangoo -d fangoo_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://fangoo:fangoo@localhost:5432/fangoo_ci?schema=public
+      # Throwaway values that satisfy the boot-time validator. Real secrets are
+      # never needed to typecheck, lint or run the unit suite.
+      JWT_ACCESS_SECRET: ci_access_secret_that_is_long_enough_to_pass_validation
+      JWT_REFRESH_SECRET: ci_refresh_secret_that_is_long_enough_and_different
+      PAYSTACK_SECRET_KEY: sk_test_ci_placeholder
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npx oxlint src
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npx vitest run
+
+      # Proves every committed migration still applies to an empty database in
+      # order, and that the schema matches them. A migration that only works
+      # against the developer's existing database is a release-day failure.
+      - name: Apply migrations to a clean database
+        run: npx prisma migrate deploy
+
+      # Catches a schema.prisma edit that was never turned into a migration.
+      # Diffs against the database just migrated above rather than replaying the
+      # migrations directory, which would need a shadow database configured.
+      # `--exit-code` returns 2 when a difference is found.
+      - name: schema.prisma matches the migrations
+        run: npx prisma migrate diff --from-config-datasource --to-schema ./prisma/schema.prisma --exit-code
+
+      - name: Build
+        run: npm run build

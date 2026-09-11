@@ -1,0 +1,22 @@
+# Keep the build context small and never ship local state into an image.
+node_modules
+dist
+.git
+.env
+.env.*
+!.env.example
+
+# Editor and agent tooling — irrelevant to a build.
+.agents
+.claude
+.cursor
+.devin
+.windsurf
+
+# Build caches and local artefacts.
+*.tsbuildinfo
+coverage
+*.log
+
+# Generated at build time by `prisma generate`, never copied in.
+src/generated
