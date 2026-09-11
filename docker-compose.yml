@@ -1,0 +1,84 @@
+# Local production parity: the two apps and a database, wired the way they would
+# be in a deployment. Not a development environment — use `npm run dev` in each
+# repo for that; these images are production builds with no hot reload.
+#
+#   cp .env.compose.example .env   (fill in the Paystack keys and JWT secrets)
+#   docker compose up --build
+#
+# Lives in the backend repo so it is version-controlled, and expects the two
+# repositories to sit side by side:
+#
+#   FANGOO/
+#     fangoo-backend/    <- this file
+#     fangoo-frontend/
+#
+# The frontend's public config is baked into the client bundle at build time,
+# which is why it appears under `build.args` and not only under `environment`.
+
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fangoo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-fangoo}
+    volumes:
+      - fangoo-db:/var/lib/postgresql/data
+    # Not published by default: only the API needs it, and exposing a database
+    # to the host is a habit worth not forming.
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-fangoo} -d ${POSTGRES_DB:-fangoo}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fangoo}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-fangoo}?schema=public
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET}
+      JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-15m}
+      JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-7d}
+      CORS_ORIGIN: ${PUBLIC_WEB_URL:-http://localhost:3000}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:?set PAYSTACK_SECRET_KEY}
+      PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
+      PAYSTACK_CURRENCY: ${PAYSTACK_CURRENCY:-GHS}
+      PAYSTACK_CALLBACK_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}/orders/payment-callback
+    ports:
+      - '${API_PORT:-4000}:4000'
+    # Apply any pending migrations before serving. `migrate deploy` only applies
+    # committed migrations — it never generates or resets, so it is safe to run
+    # on every start.
+    command: >
+      sh -c "npx prisma migrate deploy && node dist/main.js"
+
+  web:
+    build:
+      # Sibling repository — see the note at the top of this file.
+      context: ../fangoo-frontend
+      args:
+        NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4000}/api/v1
+        NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4000}/api/v1
+      NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
+    ports:
+      - '${WEB_PORT:-3000}:3000'
+
+volumes:
+  fangoo-db:
