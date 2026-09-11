@@ -1,0 +1,368 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  CUSTOMER
+  SUPPLIER
+  ADMIN
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  ABANDONED
+  // Money captured and then returned to the buyer. Distinct from SUCCESS so the
+  // payment ledger never reports refunded money as revenue.
+  REFUNDED
+}
+
+enum RequestStatus {
+  OPEN
+  AWARDED
+  CANCELLED
+  EXPIRED
+}
+
+enum OfferStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  WITHDRAWN
+  EXPIRED
+}
+
+/** Where an order came from: a catalogue listing, or an accepted RFQ offer. */
+enum OrderSource {
+  CATALOGUE
+  REQUEST
+}
+
+enum OrderStatus {
+  PENDING
+  PAYMENT_PENDING
+  PAID
+  AWAITING_CONFIRMATION
+  CONFIRMED
+  PREPARING
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  REJECTED
+  REFUND_PENDING
+  REFUNDED
+}
+
+model User {
+  id               String           @id @default(uuid())
+  email            String           @unique
+  passwordHash     String           @map("password_hash")
+  firstName        String           @map("first_name")
+  lastName         String           @map("last_name")
+  phone            String?
+  role             Role             @default(CUSTOMER)
+  isActive         Boolean          @default(true) @map("is_active")
+  refreshTokenHash String?          @map("refresh_token_hash")
+  supplierProfile  SupplierProfile?
+  orders           Order[]
+  reviews          Review[]
+  fuelRequests     FuelRequest[]
+  notifications    Notification[]
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+/** What happened, so the right recipient can be told about it. */
+enum NotificationType {
+  REQUEST_POSTED
+  OFFER_RECEIVED
+  OFFER_ACCEPTED
+  OFFER_REJECTED
+  ORDER_PAID
+  ORDER_CONFIRMED
+  ORDER_DISPATCHED
+  ORDER_DELIVERED
+  ORDER_REJECTED
+  ORDER_REFUNDED
+  SUPPLIER_VERIFIED
+  SUPPLIER_REJECTED
+}
+
+/**
+ * One thing a user should know about, owned by that user.
+ *
+ * `link` is a route in the app rather than a rendered URL, so notifications keep
+ * working if the domain changes. `entityId` records what it was about without a
+ * foreign key, so deleting an order never destroys the history of being told.
+ */
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String           @map("user_id")
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String
+  link      String?
+  entityId  String?          @map("entity_id")
+  readAt    DateTime?        @map("read_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  // The unread badge and the panel are both "this user, newest first".
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+model SupplierProfile {
+  id                 String                 @id @default(uuid())
+  userId             String                 @unique @map("user_id")
+  user               User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyName        String                 @map("company_name")
+  businessRegNumber  String?                @map("business_reg_number")
+  taxId              String?                @map("tax_id")
+  description        String?
+  address            String
+  city               String
+  postalCode         String?                @map("postal_code")
+  contactPhone       String                 @map("contact_phone")
+  contactEmail       String                 @map("contact_email")
+  verificationStatus VerificationStatus     @default(PENDING) @map("verification_status")
+  verifiedAt         DateTime?              @map("verified_at")
+  rejectionReason    String?                @map("rejection_reason")
+  isAcceptingOrders  Boolean                @default(true) @map("is_accepting_orders")
+  deliveryAreas      SupplierDeliveryArea[]
+  fuelListings       SupplierFuel[]
+  orders             Order[]
+  reviews            Review[]
+  offers             Offer[]
+  createdAt          DateTime               @default(now()) @map("created_at")
+  updatedAt          DateTime               @updatedAt @map("updated_at")
+
+  @@map("supplier_profiles")
+}
+
+model DeliveryArea {
+  id        String                 @id @default(uuid())
+  name      String                 @unique
+  city      String
+  region    String
+  isActive  Boolean                @default(true) @map("is_active")
+  suppliers SupplierDeliveryArea[]
+  orders    Order[]
+  requests  FuelRequest[]
+  createdAt DateTime               @default(now()) @map("created_at")
+  updatedAt DateTime               @updatedAt @map("updated_at")
+
+  @@map("delivery_areas")
+}
+
+model SupplierDeliveryArea {
+  id                     String          @id @default(uuid())
+  supplierProfileId      String          @map("supplier_profile_id")
+  deliveryAreaId         String          @map("delivery_area_id")
+  supplier               SupplierProfile @relation(fields: [supplierProfileId], references: [id], onDelete: Cascade)
+  deliveryArea           DeliveryArea    @relation(fields: [deliveryAreaId], references: [id], onDelete: Cascade)
+  deliveryFee            Decimal         @default(0) @map("delivery_fee") @db.Decimal(10, 2)
+  estimatedDeliveryHours Int?            @map("estimated_delivery_hours")
+  createdAt              DateTime        @default(now()) @map("created_at")
+
+  @@unique([supplierProfileId, deliveryAreaId])
+  @@map("supplier_delivery_areas")
+}
+
+model FuelType {
+  id            String         @id @default(uuid())
+  name          String         @unique
+  isActive      Boolean        @default(true) @map("is_active")
+  supplierFuels SupplierFuel[]
+  orderItems    OrderItem[]
+  requests      FuelRequest[]
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  @@map("fuel_types")
+}
+
+model SupplierFuel {
+  id                String          @id @default(uuid())
+  supplierProfileId String          @map("supplier_profile_id")
+  fuelTypeId        String          @map("fuel_type_id")
+  supplier          SupplierProfile @relation(fields: [supplierProfileId], references: [id], onDelete: Cascade)
+  fuelType          FuelType        @relation(fields: [fuelTypeId], references: [id], onDelete: Cascade)
+  pricePerLitre     Decimal         @map("price_per_litre") @db.Decimal(10, 2)
+  availableQuantity Decimal         @map("available_quantity") @db.Decimal(12, 2)
+  minimumOrderLitres Decimal        @default(1) @map("minimum_order_litres") @db.Decimal(12, 2)
+  isAvailable       Boolean         @default(true) @map("is_available")
+  /** Admin-only moderation. Kept separate from `isAvailable` so a supplier cannot lift its own suspension. */
+  isSuspended       Boolean         @default(false) @map("is_suspended")
+  suspensionReason  String?         @map("suspension_reason")
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @updatedAt @map("updated_at")
+
+  @@unique([supplierProfileId, fuelTypeId])
+  @@map("supplier_fuels")
+}
+
+model Order {
+  id                 String        @id @default(uuid())
+  customerId         String        @map("customer_id")
+  customer           User          @relation(fields: [customerId], references: [id])
+  supplierProfileId  String        @map("supplier_profile_id")
+  supplier           SupplierProfile @relation(fields: [supplierProfileId], references: [id])
+  deliveryAreaId     String        @map("delivery_area_id")
+  deliveryArea       DeliveryArea  @relation(fields: [deliveryAreaId], references: [id])
+  deliveryAddress    String        @map("delivery_address")
+  deliveryFee        Decimal       @map("delivery_fee") @db.Decimal(10, 2)
+  subtotal           Decimal       @map("subtotal") @db.Decimal(10, 2)
+  totalAmount        Decimal       @map("total_amount") @db.Decimal(10, 2)
+  status             OrderStatus   @default(PENDING)
+  source             OrderSource   @default(CATALOGUE)
+  fuelRequest        FuelRequest?
+  /** True once payment confirmation actually decremented supplier stock, so a rejection restores exactly what was taken. */
+  inventoryDeducted  Boolean       @default(false) @map("inventory_deducted")
+  cancellationReason String?       @map("cancellation_reason")
+  rejectionReason    String?       @map("rejection_reason")
+  paidAt             DateTime?     @map("paid_at")
+  confirmedAt        DateTime?     @map("confirmed_at")
+  deliveredAt        DateTime?     @map("delivered_at")
+  items              OrderItem[]
+  statusHistory      OrderStatusHistory[]
+  payment            Payment?
+  review             Review?
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  @@index([customerId])
+  @@index([supplierProfileId])
+  @@map("orders")
+}
+
+model OrderItem {
+  id            String   @id @default(uuid())
+  orderId       String   @map("order_id")
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fuelTypeId    String   @map("fuel_type_id")
+  fuelType      FuelType @relation(fields: [fuelTypeId], references: [id])
+  pricePerLitre Decimal  @map("price_per_litre") @db.Decimal(10, 2)
+  quantity      Decimal  @map("quantity") @db.Decimal(12, 2)
+  lineTotal     Decimal  @map("line_total") @db.Decimal(10, 2)
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@map("order_items")
+}
+
+/** One payment per order (MVP). A retry after a failed attempt reuses this row with a new reference. */
+model Payment {
+  id                String        @id @default(uuid())
+  orderId           String        @unique @map("order_id")
+  order             Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  provider          String        @default("paystack")
+  reference         String        @unique
+  amount            Decimal       @db.Decimal(10, 2)
+  currency          String        @default("GHS")
+  status            PaymentStatus @default(PENDING)
+  authorizationUrl  String?       @map("authorization_url")
+  providerReference String?       @map("provider_reference")
+  paidAt            DateTime?     @map("paid_at")
+  failureReason     String?       @map("failure_reason")
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+
+  @@map("payments")
+}
+
+/** One review per delivered order (§30). The unique orderId is what enforces that. */
+model Review {
+  id                String          @id @default(uuid())
+  orderId           String          @unique @map("order_id")
+  order             Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customerId        String          @map("customer_id")
+  customer          User            @relation(fields: [customerId], references: [id])
+  supplierProfileId String          @map("supplier_profile_id")
+  supplier          SupplierProfile @relation(fields: [supplierProfileId], references: [id], onDelete: Cascade)
+  rating            Int
+  comment           String?
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @updatedAt @map("updated_at")
+
+  @@index([supplierProfileId])
+  @@map("reviews")
+}
+
+/** A buyer's open requirement. Verified suppliers bid against it with offers. */
+model FuelRequest {
+  id              String        @id @default(uuid())
+  buyerId         String        @map("buyer_id")
+  buyer           User          @relation(fields: [buyerId], references: [id])
+  fuelTypeId      String        @map("fuel_type_id")
+  fuelType        FuelType      @relation(fields: [fuelTypeId], references: [id])
+  deliveryAreaId  String        @map("delivery_area_id")
+  deliveryArea    DeliveryArea  @relation(fields: [deliveryAreaId], references: [id])
+  deliveryAddress String        @map("delivery_address")
+  quantityLitres  Decimal       @map("quantity_litres") @db.Decimal(12, 2)
+  requiredBy      DateTime      @map("required_by")
+  notes           String?
+  status          RequestStatus @default(OPEN)
+  /** Set once the buyer awards the request; the order created from it. */
+  orderId         String?       @unique @map("order_id")
+  order           Order?        @relation(fields: [orderId], references: [id])
+  offers          Offer[]
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([buyerId])
+  @@map("fuel_requests")
+}
+
+/** One supplier's bid on a request. Totals are stored so an award is auditable. */
+model Offer {
+  id                String          @id @default(uuid())
+  requestId         String          @map("request_id")
+  request           FuelRequest     @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  supplierProfileId String          @map("supplier_profile_id")
+  supplier          SupplierProfile @relation(fields: [supplierProfileId], references: [id], onDelete: Cascade)
+  pricePerLitre     Decimal         @map("price_per_litre") @db.Decimal(10, 2)
+  availableQuantity Decimal         @map("available_quantity") @db.Decimal(12, 2)
+  deliveryFee       Decimal         @default(0) @map("delivery_fee") @db.Decimal(10, 2)
+  deliveryDate      DateTime        @map("delivery_date")
+  subtotal          Decimal         @db.Decimal(12, 2)
+  totalAmount       Decimal         @map("total_amount") @db.Decimal(12, 2)
+  notes             String?
+  status            OfferStatus     @default(PENDING)
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @updatedAt @map("updated_at")
+
+  @@unique([requestId, supplierProfileId])
+  @@index([supplierProfileId])
+  @@map("offers")
+}
+
+model OrderStatusHistory {
+  id         String       @id @default(uuid())
+  orderId    String       @map("order_id")
+  order      Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromStatus OrderStatus? @map("from_status")
+  toStatus   OrderStatus  @map("to_status")
+  note       String?
+  createdAt  DateTime     @default(now()) @map("created_at")
+
+  @@map("order_status_history")
+}
