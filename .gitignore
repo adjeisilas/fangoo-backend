@@ -37,6 +37,8 @@ lerna-debug.log*
 
 # dotenv environment variable files
 .env
+# Real values for the docker-compose stack. The `.example` beside it is tracked.
+.env.compose
 .env.development.local
 .env.test.local
 .env.production.local

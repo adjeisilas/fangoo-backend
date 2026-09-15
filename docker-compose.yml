@@ -2,8 +2,11 @@
 # be in a deployment. Not a development environment — use `npm run dev` in each
 # repo for that; these images are production builds with no hot reload.
 #
-#   cp .env.compose.example .env   (fill in the Paystack keys and JWT secrets)
-#   docker compose up --build
+#   cp .env.compose.example .env.compose   (fill in the secrets)
+#   docker compose --env-file .env.compose up --build
+#
+# `.env.compose`, never `.env`: Compose would otherwise read — and the copy step
+# would overwrite — this repo's development `.env`, which holds real keys.
 #
 # Lives in the backend repo so it is version-controlled, and expects the two
 # repositories to sit side by side:
@@ -11,6 +14,9 @@
 #   FANGOO/
 #     fangoo-backend/    <- this file
 #     fangoo-frontend/
+#
+# Host ports default to 3200/4200 so the stack runs alongside the development
+# servers on 3000/4000 instead of fighting them for the port.
 #
 # The frontend's public config is baked into the client bundle at build time,
 # which is why it appears under `build.args` and not only under `environment`.
@@ -48,13 +54,13 @@ services:
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET}
       JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-15m}
       JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-7d}
-      CORS_ORIGIN: ${PUBLIC_WEB_URL:-http://localhost:3000}
+      CORS_ORIGIN: ${PUBLIC_WEB_URL:-http://localhost:3200}
       PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:?set PAYSTACK_SECRET_KEY}
       PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
       PAYSTACK_CURRENCY: ${PAYSTACK_CURRENCY:-GHS}
-      PAYSTACK_CALLBACK_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}/orders/payment-callback
+      PAYSTACK_CALLBACK_URL: ${PUBLIC_WEB_URL:-http://localhost:3200}/orders/payment-callback
     ports:
-      - '${API_PORT:-4000}:4000'
+      - '${API_PORT:-4200}:4000'
     # Apply any pending migrations before serving. `migrate deploy` only applies
     # committed migrations — it never generates or resets, so it is safe to run
     # on every start.
@@ -66,8 +72,8 @@ services:
       # Sibling repository — see the note at the top of this file.
       context: ../fangoo-frontend
       args:
-        NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4000}/api/v1
-        NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
+        NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4200}/api/v1
+        NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3200}
     restart: unless-stopped
     depends_on:
       - api
@@ -75,10 +81,15 @@ services:
       NODE_ENV: production
       PORT: 3000
       HOST: 0.0.0.0
-      NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4000}/api/v1
-      NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
+      NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4200}/api/v1
+      NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3200}
+      # The production boot guard refuses localhost URLs, because on a real
+      # deploy they point every visitor's browser at their own machine. Here the
+      # browser genuinely is on this machine, so this stack opts out explicitly.
+      # Never set this on a real deployment.
+      FANGOO_ALLOW_LOCAL_URLS: 'true'
     ports:
-      - '${WEB_PORT:-3000}:3000'
+      - '${WEB_PORT:-3200}:3000'
 
 volumes:
   fangoo-db:

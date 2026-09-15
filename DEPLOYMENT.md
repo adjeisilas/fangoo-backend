@@ -174,8 +174,19 @@ FANGOO/
 ```
 
 ```bash
-cp .env.compose.example .env      # fill in secrets
-docker compose up --build
+cp .env.compose.example .env.compose   # fill in secrets — NOT .env
+docker compose --env-file .env.compose up --build
+```
+
+Use `.env.compose`, never `.env`: this repo's `.env` is the development config
+and holds real keys, and copying the example over it would destroy them. The
+stack serves on **3200** (web) and **4200** (API) so it runs alongside the
+development servers on 3000/4000.
+
+```bash
+# afterwards
+docker compose --env-file .env.compose down        # stop, keep the database
+docker compose --env-file .env.compose down -v     # stop and wipe the database
 ```
 
 Migrations are applied by the `api` service on start via `prisma migrate deploy`,
