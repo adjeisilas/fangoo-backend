@@ -120,7 +120,7 @@ so setting them only at runtime leaves the browser calling whatever the build
 used:
 
 ```
-NODE_ENV              production
+NODE_ENV              development
 NUXT_PUBLIC_API_BASE  https://<api-domain>/api/v1
 NUXT_PUBLIC_SITE_URL  https://<web-domain>
 ```
@@ -237,5 +237,19 @@ build time and every canonical tag is wrong too.
   is provider-agnostic, so adding one is configuration rather than a rewrite.
 - **No automated backups.** Whatever hosts PostgreSQL should take them.
 - **The Docker images have not been built.** Docker was unavailable on the
-  machine where they were written, so the Dockerfiles and compose file are
-  unverified. Build them locally once before relying on them.
+  machine where they were written, so `docker build` itself is untested — layer
+  copying, the Alpine base and the build stages have never actually run.
+
+  What *has* been verified, by reproducing the runtime image's exact contents
+  (`dist/`, `prisma/`, `prisma7.config.ts`, `package.json`, and a
+  `--omit=dev` install) in a clean directory and running it:
+
+  - every package the container needs survives the dependency prune
+  - `prisma migrate deploy` applies all migrations from that pruned tree
+  - `node dist/main.js` boots and serves `/api/v1/health` with
+    `database: connected`
+  - the `HEALTHCHECK` command returns 0 when healthy and 1 when not
+  - `Strict-Transport-Security` is sent and `X-Powered-By` removed
+
+  So the contents and commands are known good; only the image build itself is
+  unproven. Build once locally, or let the first Railway deploy be the test.
