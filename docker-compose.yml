@@ -18,8 +18,8 @@
 # Host ports default to 3200/4200 so the stack runs alongside the development
 # servers on 3000/4000 instead of fighting them for the port.
 #
-# The frontend's public config is baked into the client bundle at build time,
-# which is why it appears under `build.args` and not only under `environment`.
+# The frontend's public config is read when its server starts, so it lives under
+# `environment` only. Changing a URL needs a restart, not a rebuild.
 
 services:
   db:
@@ -30,7 +30,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-fangoo}
     volumes:
-      - fangoo-db:/var/lib/postgresql/data
+      # postgres:18 stores data in a major-version subdirectory and refuses to
+      # start when the volume is mounted at the old .../data path.
+      - fangoo-db:/var/lib/postgresql
     # Not published by default: only the API needs it, and exposing a database
     # to the host is a habit worth not forming.
     healthcheck:
@@ -71,9 +73,6 @@ services:
     build:
       # Sibling repository — see the note at the top of this file.
       context: ../fangoo-frontend
-      args:
-        NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4200}/api/v1
-        NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3200}
     restart: unless-stopped
     depends_on:
       - api
@@ -83,6 +82,9 @@ services:
       HOST: 0.0.0.0
       NUXT_PUBLIC_API_BASE: ${PUBLIC_API_URL:-http://localhost:4200}/api/v1
       NUXT_PUBLIC_SITE_URL: ${PUBLIC_WEB_URL:-http://localhost:3200}
+      # Server-side rendering runs inside this container, where localhost:4200 is
+      # not the API. The browser keeps using the public URL above.
+      NUXT_API_BASE_SERVER: http://api:4000/api/v1
       # The production boot guard refuses localhost URLs, because on a real
       # deploy they point every visitor's browser at their own machine. Here the
       # browser genuinely is on this machine, so this stack opts out explicitly.

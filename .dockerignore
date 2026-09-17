@@ -20,3 +20,11 @@ coverage
 
 # Generated at build time by `prisma generate`, never copied in.
 src/generated
+
+# Not needed to build or run the API. Kept out so editing them does not
+# invalidate the build cache and repeat every step after `COPY . .`.
+**/*.md
+.github
+docker-compose.yml
+Dockerfile
+.dockerignore
