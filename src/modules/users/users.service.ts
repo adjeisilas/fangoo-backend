@@ -7,6 +7,7 @@ import { PrismaService } from '../../prisma/prisma.service.js';
 import { Role } from '../../generated/prisma/client.js';
 import { UpdateUserProfileDto } from './dto/update-user-profile.dto.js';
 import { AdminUpdateUserDto } from './dto/admin-update-user.dto.js';
+import { DELIVERY_AREA_WITH_REGION } from '../delivery-areas/delivery-area.query.js';
 
 @Injectable()
 export class UsersService {
@@ -107,7 +108,7 @@ export class UsersService {
           include: {
             deliveryAreas: {
               include: {
-                deliveryArea: true,
+                deliveryArea: DELIVERY_AREA_WITH_REGION,
               },
             },
           },

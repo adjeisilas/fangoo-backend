@@ -163,6 +163,25 @@ export class AuthService {
     return this.sanitizeUser(user);
   }
 
+  /**
+   * Signs in a user whose account was just created by another flow (a supplier
+   * application), issuing tokens exactly as `login` does. Keeps session creation
+   * in this service rather than copied into each caller.
+   */
+  async startSession(user: User): Promise<AuthResponse> {
+    if (!user.isActive) {
+      throw new UnauthorizedException('Account has been deactivated');
+    }
+
+    const tokens = await this.generateTokens(user.id, user.email, user.role);
+    await this.updateRefreshTokenHash(user.id, tokens.refreshToken);
+
+    return {
+      user: this.sanitizeUser(user),
+      tokens,
+    };
+  }
+
   private async generateTokens(
     userId: string,
     email: string,

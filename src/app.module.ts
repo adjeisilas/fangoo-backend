@@ -16,6 +16,7 @@ import { ReviewsModule } from './modules/reviews/reviews.module.js';
 import { RequestsModule } from './modules/requests/requests.module.js';
 import { AnalyticsModule } from './modules/analytics/analytics.module.js';
 import { NotificationsModule } from './modules/notifications/notifications.module.js';
+import { SupplierApplicationsModule } from './modules/supplier-applications/supplier-applications.module.js';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
     UsersModule,
     DeliveryAreasModule,
     SuppliersModule,
+    SupplierApplicationsModule,
     FuelTypesModule,
     OrdersModule,
     PaymentsModule,

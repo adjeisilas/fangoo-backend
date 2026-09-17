@@ -23,6 +23,7 @@ import { JwtRefreshGuard } from './guards/jwt-refresh.guard.js';
 import { CurrentUser } from './decorators/current-user.decorator.js';
 import { Public } from './decorators/public.decorator.js';
 import type { SanitizedUser } from './types/auth.types.js';
+import { writeRefreshTokenCookie } from './refresh-token-cookie.js';
 
 interface RefreshRequest extends Request {
   user: {
@@ -114,12 +115,6 @@ export class AuthController {
   }
 
   private setRefreshTokenCookie(res: Response, refreshToken: string) {
-    res.cookie('refresh_token', refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      path: '/',
-    });
+    writeRefreshTokenCookie(res, refreshToken);
   }
 }

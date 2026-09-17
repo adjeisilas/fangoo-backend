@@ -193,6 +193,33 @@ describe('AuthService', () => {
     });
   });
 
+  describe('startSession', () => {
+    it('issues tokens and stores the refresh-token hash, as sign-in does', async () => {
+      mockPrisma.user.update.mockResolvedValue(mockUser);
+
+      const result = await authService.startSession(mockUser as any);
+
+      expect(result.tokens).toEqual({
+        accessToken: 'jwt-user-uuid-1',
+        refreshToken: 'jwt-user-uuid-1',
+      });
+      expect(mockPrisma.user.update).toHaveBeenCalledWith({
+        where: { id: mockUser.id },
+        data: { refreshTokenHash: expect.any(String) },
+      });
+      expect(result.user.email).toBe('john@example.com');
+      expect((result.user as any).passwordHash).toBeUndefined();
+      expect((result.user as any).refreshTokenHash).toBeUndefined();
+    });
+
+    it('refuses a deactivated account', async () => {
+      await expect(
+        authService.startSession({ ...mockUser, isActive: false } as any),
+      ).rejects.toThrow(UnauthorizedException);
+      expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    });
+  });
+
   describe('getMe', () => {
     it('should return sanitized user profile', async () => {
       mockPrisma.user.findUnique.mockResolvedValue(mockUser);

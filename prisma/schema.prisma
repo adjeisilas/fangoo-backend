@@ -158,18 +158,44 @@ model SupplierProfile {
   @@map("supplier_profiles")
 }
 
-model DeliveryArea {
-  id        String                 @id @default(uuid())
-  name      String                 @unique
-  city      String
-  region    String
-  isActive  Boolean                @default(true) @map("is_active")
-  suppliers SupplierDeliveryArea[]
-  orders    Order[]
-  requests  FuelRequest[]
-  createdAt DateTime               @default(now()) @map("created_at")
-  updatedAt DateTime               @updatedAt @map("updated_at")
+/**
+ * One of Ghana's 16 administrative regions: a geographic grouping for delivery
+ * areas, never a coverage unit in its own right. The ids are fixed, and inserted
+ * by the migration that created this table, so every environment shares them.
+ */
+model Region {
+  id            String         @id @default(uuid())
+  name          String         @unique
+  capital       String
+  deliveryAreas DeliveryArea[]
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
 
+  @@map("regions")
+}
+
+/**
+ * What a supplier actually covers, and what orders and requests point at.
+ * Grouped geographically by `region`.
+ */
+model DeliveryArea {
+  id           String                 @id @default(uuid())
+  name         String                 @unique
+  city         String
+  regionId     String                 @map("region_id")
+  region       Region                 @relation(fields: [regionId], references: [id])
+  // The free-text region each row had before regions were modelled. Only the
+  // migration that introduced `regionId` reads it, to backfill; the API never
+  // exposes it. Remove it in a later migration once the backfill is verified.
+  legacyRegion String?                @map("region")
+  isActive     Boolean                @default(true) @map("is_active")
+  suppliers    SupplierDeliveryArea[]
+  orders       Order[]
+  requests     FuelRequest[]
+  createdAt    DateTime               @default(now()) @map("created_at")
+  updatedAt    DateTime               @updatedAt @map("updated_at")
+
+  @@index([regionId])
   @@map("delivery_areas")
 }
 

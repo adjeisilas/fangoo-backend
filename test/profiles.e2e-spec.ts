@@ -99,6 +99,16 @@ describe('Profiles & Delivery Areas (e2e)', () => {
       expect(Array.isArray(response.body.data)).toBe(true);
       expect(response.body.data.length).toBeGreaterThan(0);
 
+      // Every area belongs to a region, and only the relation is exposed.
+      for (const area of response.body.data) {
+        expect(area.region).toEqual({
+          id: expect.any(String),
+          name: expect.any(String),
+          capital: expect.any(String),
+        });
+        expect(area).not.toHaveProperty('legacyRegion');
+      }
+
       testAreaId = response.body.data[0].id;
     });
   });

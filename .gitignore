@@ -62,3 +62,13 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # TypeScript incremental build cache. Machine-specific, and a stale copy has
 # already caused the build to disagree with the source once.
 *.tsbuildinfo
+
+# AI assistant tooling: per-tool configuration and vendored skill packs, restored
+# locally by `prisma skills sync`. None of it is needed to build, test or run
+# Fangoo. The project's own .agents/skills/fangoo-project stays tracked.
+.claude/
+.cursor/
+.devin/
+.windsurf/
+skills-lock.json
+.agents/skills/prisma-*/
