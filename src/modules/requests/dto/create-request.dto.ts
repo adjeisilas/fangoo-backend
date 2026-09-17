@@ -1,5 +1,6 @@
 import {
   IsDateString,
+  Max,
   IsNotEmpty,
   IsNumber,
   IsOptional,
@@ -7,6 +8,10 @@ import {
   IsString,
   MaxLength,
 } from 'class-validator';
+import {
+  MAX_LITRES,
+  MAX_LITRES_MESSAGE,
+} from '../../../common/constants/money.js';
 
 export class CreateRequestDto {
   @IsString()
@@ -24,6 +29,7 @@ export class CreateRequestDto {
 
   @IsNumber()
   @IsPositive({ message: 'Quantity must be greater than zero' })
+  @Max(MAX_LITRES, { message: MAX_LITRES_MESSAGE })
   quantityLitres!: number;
 
   @IsDateString({}, { message: 'Required-by date must be a valid date' })

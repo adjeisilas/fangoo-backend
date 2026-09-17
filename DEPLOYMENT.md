@@ -302,10 +302,13 @@ developer's existing database fails there rather than on release day.
 ## Verifying a deploy
 
 ```bash
-curl https://<api>/api/v1/health          # {"database":"connected"}
-curl -I https://<web>/                    # 200
+curl -i https://<api>/api/v1/health       # 200, {"database":"connected"}
+curl -I https://<web>/                    # 200, with X-Frame-Options: DENY
 curl https://<web>/robots.txt             # Sitemap: points at the real domain
 ```
+
+Health answers **503** when the database does not respond, so a platform that
+watches the status code takes a broken instance out of rotation by itself.
 
 If `robots.txt` advertises the wrong domain, `NUXT_PUBLIC_SITE_URL` is wrong on
 the web service and every canonical tag is wrong too.

@@ -258,6 +258,30 @@ describe('OrdersService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
+    /**
+     * Regression: lines that each pass validation can still multiply out past
+     * Decimal(10, 2), which reached the database and came back as a 500.
+     */
+    it('refuses an order whose total cannot fit the money columns', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockSupplier);
+      mockPrisma.supplierDeliveryArea.findUnique.mockResolvedValue(mockCoverage);
+      mockPrisma.supplierFuel.findMany.mockResolvedValue([
+        {
+          ...mockListing,
+          pricePerLitre: new Prisma.Decimal(5000),
+          availableQuantity: new Prisma.Decimal(10_000_000),
+        },
+      ]);
+
+      await expect(
+        service.createOrder('customer-1', {
+          ...dto,
+          items: [{ fuelTypeId: 'fuel-1', quantity: 1_000_000 }],
+        }),
+      ).rejects.toThrow('This order is too large to place. Please split it.');
+      expect(mockPrisma.order.create).not.toHaveBeenCalled();
+    });
+
     it('should throw BadRequestException when requested quantity exceeds availability', async () => {
       mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockSupplier);
       mockPrisma.supplierDeliveryArea.findUnique.mockResolvedValue(

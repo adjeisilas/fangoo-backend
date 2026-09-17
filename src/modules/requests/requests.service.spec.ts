@@ -340,6 +340,23 @@ describe('RequestsService', () => {
       expect(data.totalAmount.toString()).toBe('372500');
     });
 
+    /** An offer becomes an order, so it has to fit the order's money columns. */
+    it('refuses an offer whose total cannot fit the money columns', async () => {
+      mockPrisma.fuelRequest.findUnique.mockResolvedValue({
+        ...openRequest,
+        quantityLitres: new Prisma.Decimal(1_000_000),
+      });
+
+      await expect(
+        service.submitOffer('request-1', 'supplier-user-1', {
+          ...offerDto,
+          pricePerLitre: 5000,
+          availableQuantity: 1_000_000,
+        }),
+      ).rejects.toThrow('This offer is too large to place');
+      expect(mockPrisma.offer.create).not.toHaveBeenCalled();
+    });
+
     it('refuses a bid that cannot cover the full requirement', async () => {
       await expect(
         service.submitOffer('request-1', 'supplier-user-1', {

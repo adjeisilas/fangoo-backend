@@ -109,6 +109,24 @@ describe('ReviewsService', () => {
     });
   });
 
+  /** Two submissions can both pass the check; the unique index stops the second. */
+  it('turns a unique-constraint failure into a conflict, not a 500', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({
+      id: 'order-1',
+      customerId: 'customer-1',
+      supplierProfileId: 'supplier-1',
+      status: OrderStatus.DELIVERED,
+      review: null,
+    });
+    mockPrisma.review.create.mockRejectedValue(
+      Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }),
+    );
+
+    await expect(
+      service.createReview('customer-1', { orderId: 'order-1', rating: 5 }),
+    ).rejects.toThrow('You have already reviewed this order');
+  });
+
   describe('getSupplierReviews', () => {
     it('should return reviews with the aggregate rating', async () => {
       mockPrisma.review.findMany.mockResolvedValue([

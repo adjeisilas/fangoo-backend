@@ -117,6 +117,23 @@ describe('AuthService', () => {
         }),
       ).rejects.toThrow(ConflictException);
     });
+
+    /** Two registrations racing for one address both pass the lookup. */
+    it('turns a unique-constraint failure into a conflict, not a 500', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+      mockPrisma.user.create.mockRejectedValue(
+        Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }),
+      );
+
+      await expect(
+        authService.register({
+          email: 'john@example.com',
+          password: 'Password123!',
+          firstName: 'John',
+          lastName: 'Doe',
+        }),
+      ).rejects.toThrow('A user with this email address already exists');
+    });
   });
 
   describe('login', () => {
@@ -153,6 +170,42 @@ describe('AuthService', () => {
           password: 'Password123!',
         }),
       ).rejects.toThrow(UnauthorizedException);
+    });
+
+    /**
+     * Regression: an address with no account was refused without hashing
+     * anything, so it answered far faster than a wrong password on a real
+     * account — enough to tell whether someone is registered here.
+     */
+    it('hashes a password even when no account matches', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(null);
+
+      const startedAt = performance.now();
+      await expect(
+        authService.login({ email: 'nobody@example.com', password: 'Password123!' }),
+      ).rejects.toThrow('Invalid email or password');
+      const elapsed = performance.now() - startedAt;
+
+      // argon2 costs ~150ms here; refusing without hashing takes under a
+      // millisecond. The bound is loose so a slow machine cannot fail it.
+      expect(elapsed).toBeGreaterThan(20);
+    });
+
+    /** Whether an account is deactivated is only told to whoever knows its password. */
+    it('does not reveal a deactivated account to a wrong password', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, isActive: false });
+
+      await expect(
+        authService.login({ email: 'john@example.com', password: 'WrongPassword!' }),
+      ).rejects.toThrow('Invalid email or password');
+    });
+
+    it('tells the account holder when their account is deactivated', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, isActive: false });
+
+      await expect(
+        authService.login({ email: 'john@example.com', password: 'Secret123!' }),
+      ).rejects.toThrow('Account has been deactivated');
     });
   });
 

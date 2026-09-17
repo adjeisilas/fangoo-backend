@@ -22,6 +22,7 @@ import {
   type OrderActor,
 } from '../../common/constants/order-status-transitions.js';
 import { CreateOrderDto } from './dto/create-order.dto.js';
+import { MAX_AMOUNT } from '../../common/constants/money.js';
 import { DELIVERY_AREA_WITH_REGION } from '../delivery-areas/delivery-area.query.js';
 
 const ORDER_INCLUDE = {
@@ -209,6 +210,14 @@ export class OrdersService {
     }
 
     const totalAmount = subtotal.plus(coverage.deliveryFee);
+
+    // Individually valid lines can still multiply out past what the money
+    // columns hold, which used to reach the database and fail as a 500.
+    if (totalAmount.greaterThan(MAX_AMOUNT)) {
+      throw new BadRequestException(
+        'This order is too large to place. Please split it.',
+      );
+    }
 
     return this.prisma.$transaction(async (tx) => {
       const order = await tx.order.create({

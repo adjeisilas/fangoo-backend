@@ -20,6 +20,8 @@ import {
 } from '../../generated/prisma/client.js';
 import { CreateRequestDto } from './dto/create-request.dto.js';
 import { CreateOfferDto } from './dto/create-offer.dto.js';
+import { isUniqueViolation } from '../../common/prisma-errors.js';
+import { MAX_AMOUNT } from '../../common/constants/money.js';
 import { DELIVERY_AREA_WITH_REGION } from '../delivery-areas/delivery-area.query.js';
 
 const REQUEST_INCLUDE = {
@@ -286,6 +288,13 @@ export class RequestsService {
     const subtotal = pricePerLitre.times(request.quantityLitres);
     const totalAmount = subtotal.plus(deliveryFee);
 
+    // An offer becomes an order, so it has to fit the order's money columns.
+    if (totalAmount.greaterThan(MAX_AMOUNT)) {
+      throw new BadRequestException(
+        'This offer is too large to place. Lower the price or the delivery fee.',
+      );
+    }
+
     const data = {
       pricePerLitre,
       availableQuantity: quantity,
@@ -367,7 +376,7 @@ export class RequestsService {
       });
       return created.id;
     } catch (err) {
-      if ((err as { code?: unknown } | null)?.code === 'P2002') {
+      if (isUniqueViolation(err)) {
         throw new ConflictException(
           'Your offer is already being submitted. Refresh to see it.',
         );

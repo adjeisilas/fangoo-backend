@@ -9,6 +9,7 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as argon2 from 'argon2';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { isUniqueViolation } from '../../common/prisma-errors.js';
 import { Role, User } from '../../generated/prisma/client.js';
 import { RegisterDto } from './dto/register.dto.js';
 import { LoginDto } from './dto/login.dto.js';
@@ -18,6 +19,13 @@ import {
   JwtPayload,
   SanitizedUser,
 } from './types/auth.types.js';
+
+/**
+ * Verified against when no account matches, so a failed sign-in costs the same
+ * either way. A real argon2 hash of a value nobody can supply.
+ */
+const DUMMY_PASSWORD_HASH =
+  '$argon2id$v=19$m=65536,p=4,t=3$62LfiC83Fya+6AJG9wGQ5Q$HZVcgr3wzCR7F7UXrz3L9TC7r+McG2HWlNdnQ9Vq9Xw';
 
 @Injectable()
 export class AuthService {
@@ -59,16 +67,27 @@ export class AuthService {
 
     const passwordHash = await argon2.hash(dto.password);
 
-    const user = await this.prisma.user.create({
-      data: {
-        email: normalizedEmail,
-        passwordHash,
-        firstName: dto.firstName.trim(),
-        lastName: dto.lastName.trim(),
-        phone: dto.phone?.trim() || null,
-        role: dto.role || Role.CUSTOMER,
-      },
-    });
+    // Two registrations racing for one address both pass the check above; the
+    // unique index stops the second, and it deserves the same 409 as the first.
+    const user = await this.prisma.user
+      .create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          firstName: dto.firstName.trim(),
+          lastName: dto.lastName.trim(),
+          phone: dto.phone?.trim() || null,
+          role: dto.role || Role.CUSTOMER,
+        },
+      })
+      .catch((err: unknown) => {
+        if (isUniqueViolation(err)) {
+          throw new ConflictException(
+            'A user with this email address already exists',
+          );
+        }
+        throw err;
+      });
 
     const tokens = await this.generateTokens(user.id, user.email, user.role);
     await this.updateRefreshTokenHash(user.id, tokens.refreshToken);
@@ -86,21 +105,23 @@ export class AuthService {
       where: { email: normalizedEmail },
     });
 
-    if (!user) {
+    /*
+     * Always hash, even for an address with no account. Returning early would
+     * answer in a fraction of the time, which is enough to tell someone whether
+     * an address is registered here.
+     */
+    const passwordMatches = await argon2
+      .verify(user?.passwordHash ?? DUMMY_PASSWORD_HASH, dto.password)
+      .catch(() => false);
+
+    if (!user || !passwordMatches) {
       throw new UnauthorizedException('Invalid email or password');
     }
 
+    // Only after the password is proven: whether an account is deactivated is
+    // the account holder's business, not a probe's.
     if (!user.isActive) {
       throw new UnauthorizedException('Account has been deactivated');
-    }
-
-    const passwordMatches = await argon2.verify(
-      user.passwordHash,
-      dto.password,
-    );
-
-    if (!passwordMatches) {
-      throw new UnauthorizedException('Invalid email or password');
     }
 
     const tokens = await this.generateTokens(user.id, user.email, user.role);

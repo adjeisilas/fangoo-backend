@@ -15,6 +15,7 @@ import {
   toCoverageRows,
 } from '../suppliers/supplier-coverage.js';
 import { CreateSupplierApplicationDto } from './dto/create-supplier-application.dto.js';
+import { isUniqueViolation } from '../../common/prisma-errors.js';
 
 const EMAIL_TAKEN = 'A user with this email address already exists';
 
@@ -121,8 +122,3 @@ export class SupplierApplicationsService {
     };
   }
 }
-
-const isUniqueViolation = (err: unknown): boolean =>
-  typeof err === 'object' &&
-  err !== null &&
-  (err as { code?: unknown }).code === 'P2002';

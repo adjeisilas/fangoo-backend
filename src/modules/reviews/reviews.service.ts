@@ -8,6 +8,7 @@ import {
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { OrderStatus } from '../../generated/prisma/client.js';
 import { CreateReviewDto } from './dto/create-review.dto.js';
+import { isUniqueViolation } from '../../common/prisma-errors.js';
 
 const REVIEW_INCLUDE = {
   customer: { select: { firstName: true, lastName: true } },
@@ -46,16 +47,25 @@ export class ReviewsService {
       throw new ConflictException('You have already reviewed this order');
     }
 
-    return this.prisma.review.create({
-      data: {
-        orderId: order.id,
-        customerId,
-        supplierProfileId: order.supplierProfileId,
-        rating: dto.rating,
-        comment: dto.comment?.trim() || null,
-      },
-      include: REVIEW_INCLUDE,
-    });
+    // One review per order is enforced by the unique index, which is what stops
+    // two submissions racing past the check above.
+    return this.prisma.review
+      .create({
+        data: {
+          orderId: order.id,
+          customerId,
+          supplierProfileId: order.supplierProfileId,
+          rating: dto.rating,
+          comment: dto.comment?.trim() || null,
+        },
+        include: REVIEW_INCLUDE,
+      })
+      .catch((err: unknown) => {
+        if (isUniqueViolation(err)) {
+          throw new ConflictException('You have already reviewed this order');
+        }
+        throw err;
+      });
   }
 
   async getSupplierReviews(supplierProfileId: string) {
