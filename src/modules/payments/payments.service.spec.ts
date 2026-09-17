@@ -36,21 +36,37 @@ describe('PaymentsService', () => {
     orderId: 'order-1',
     reference: 'fangoo_ref_1',
     amount: new Prisma.Decimal('182.50'),
+    currency: 'GHS',
     status: PaymentStatus.PENDING,
     order: mockOrder,
   };
+
+  /** A verified, successful Paystack transaction for the whole order. */
+  const successFor = (reference: string) => ({
+    status: 'success',
+    reference,
+    amount: 18250,
+    currency: 'GHS',
+    paidAt: null,
+    gatewayResponse: 'Successful',
+    orderId: 'order-1',
+  });
 
   beforeEach(() => {
     mockPrisma = {
       order: {
         findUnique: vi.fn(),
+        findUniqueOrThrow: vi.fn().mockResolvedValue(mockOrder),
         update: vi.fn(),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
       payment: {
         findUnique: vi.fn(),
+        findUniqueOrThrow: vi.fn(),
         findMany: vi.fn().mockResolvedValue([]),
         upsert: vi.fn(),
         update: vi.fn(),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
       orderStatusHistory: {
         create: vi.fn(),
@@ -63,7 +79,8 @@ describe('PaymentsService', () => {
 
     mockPaystack = {
       initializeTransaction: vi.fn(),
-      verifyTransaction: vi.fn(),
+      // Paystack answers an unknown reference with an error.
+      verifyTransaction: vi.fn().mockRejectedValue(new Error('Transaction reference not found')),
       verifyWebhookSignature: vi.fn(),
       refundTransaction: vi
         .fn()
@@ -101,14 +118,35 @@ describe('PaymentsService', () => {
         expect.objectContaining({
           email: 'customer@example.com',
           amount: '182.5',
+          // Lets a payment through an older checkout link still find its order.
+          orderId: 'order-1',
         }),
       );
       expect(mockPrisma.payment.upsert).toHaveBeenCalled();
       // PENDING orders advance to PAYMENT_PENDING when checkout starts
-      expect(mockPrisma.order.update).toHaveBeenCalledWith({
-        where: { id: 'order-1' },
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: 'order-1', status: OrderStatus.PENDING },
         data: { status: OrderStatus.PAYMENT_PENDING },
       });
+      expect(mockPrisma.orderStatusHistory.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not overwrite a cancellation that landed while checkout started', async () => {
+      mockPrisma.order.findUnique.mockResolvedValue({
+        ...mockOrder,
+        status: OrderStatus.PENDING,
+      });
+      mockPaystack.initializeTransaction.mockResolvedValue({
+        authorizationUrl: 'https://checkout.paystack.com/abc',
+        accessCode: 'abc',
+        reference: 'generated',
+      });
+      mockPrisma.order.updateMany.mockResolvedValue({ count: 0 });
+
+      await service.initializePayment('order-1', 'customer-1');
+
+      expect(mockPrisma.order.update).not.toHaveBeenCalled();
+      expect(mockPrisma.orderStatusHistory.create).not.toHaveBeenCalled();
     });
 
     it('should throw ForbiddenException when the order belongs to someone else', async () => {
@@ -166,7 +204,7 @@ describe('PaymentsService', () => {
         paidAt: '2026-09-10T12:00:00.000Z',
         gatewayResponse: 'Successful',
       });
-      mockPrisma.payment.update.mockResolvedValue({
+      mockPrisma.payment.findUniqueOrThrow.mockResolvedValue({
         ...mockPayment,
         status: PaymentStatus.SUCCESS,
       });
@@ -182,13 +220,15 @@ describe('PaymentsService', () => {
           }),
         }),
       );
-      expect(mockPrisma.order.update).toHaveBeenCalledWith(
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
+          where: { id: 'order-1', status: OrderStatus.PAYMENT_PENDING },
           data: expect.objectContaining({ status: OrderStatus.PAID }),
         }),
       );
-      expect(mockPrisma.order.update).toHaveBeenCalledWith(
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
+          where: { id: 'order-1', status: OrderStatus.PAID },
           data: expect.objectContaining({
             status: OrderStatus.AWAITING_CONFIRMATION,
           }),
@@ -196,10 +236,109 @@ describe('PaymentsService', () => {
       );
     });
 
-    it('should not touch catalogue stock for an RFQ-sourced order', async () => {
-      mockPrisma.payment.findUnique.mockResolvedValue({
+    /**
+     * Regression: the webhook and the buyer's return both confirmed the same
+     * payment at once. Both passed the "already settled" check, so stock was
+     * deducted twice. Only the confirmation that claims the payment may proceed.
+     */
+    it('does nothing when a concurrent confirmation already claimed the payment', async () => {
+      mockPrisma.payment.findUnique.mockResolvedValue(mockPayment);
+      mockPaystack.verifyTransaction.mockResolvedValue(successFor('fangoo_ref_1'));
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+      mockPrisma.payment.findUniqueOrThrow.mockResolvedValue({
         ...mockPayment,
-        order: { ...mockOrder, source: OrderSource.REQUEST },
+        status: PaymentStatus.SUCCESS,
+      });
+
+      const result = await service.confirmPayment('fangoo_ref_1');
+
+      expect(result.alreadyProcessed).toBe(true);
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: 'payment-1',
+            status: { notIn: [PaymentStatus.SUCCESS, PaymentStatus.REFUNDED] },
+          },
+        }),
+      );
+      expect(mockPrisma.supplierFuel.updateMany).not.toHaveBeenCalled();
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rolls back when the order moved while the payment was confirmed', async () => {
+      mockPrisma.payment.findUnique.mockResolvedValue(mockPayment);
+      mockPaystack.verifyTransaction.mockResolvedValue(successFor('fangoo_ref_1'));
+      mockPrisma.order.updateMany.mockResolvedValue({ count: 0 });
+
+      // Thrown inside the transaction, so the payment claim is undone too and a
+      // redelivered webhook starts again from the order's new state.
+      await expect(service.confirmPayment('fangoo_ref_1')).rejects.toThrow(
+        ConflictException,
+      );
+    });
+
+    /**
+     * Regression: cancelling left the Paystack checkout link usable. Paying
+     * through it took the money, but the order stayed CANCELLED, which cannot be
+     * refunded, so the buyer's money was stuck.
+     */
+    it('queues a refund when a cancelled order is paid anyway', async () => {
+      mockPrisma.payment.findUnique.mockResolvedValue(mockPayment);
+      mockPaystack.verifyTransaction.mockResolvedValue(successFor('fangoo_ref_1'));
+      mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+        ...mockOrder,
+        status: OrderStatus.CANCELLED,
+      });
+
+      const result = await service.confirmPayment('fangoo_ref_1');
+
+      expect(result.alreadyProcessed).toBe(false);
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: PaymentStatus.SUCCESS }),
+        }),
+      );
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: 'order-1', status: OrderStatus.CANCELLED },
+        data: { status: OrderStatus.REFUND_PENDING },
+      });
+      expect(mockPrisma.orderStatusHistory.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          fromStatus: OrderStatus.CANCELLED,
+          toStatus: OrderStatus.REFUND_PENDING,
+        }),
+      });
+      // Nothing was sold, so nothing is drawn from stock.
+      expect(mockPrisma.supplierFuel.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('decides the path from the order as it is after the claim', async () => {
+      // The order is read inside the transaction, after the claim, and that read
+      // alone decides which moves are made — here from PENDING.
+      mockPrisma.payment.findUnique.mockResolvedValue(mockPayment);
+      mockPaystack.verifyTransaction.mockResolvedValue(successFor('fangoo_ref_1'));
+      mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+        ...mockOrder,
+        status: OrderStatus.PENDING,
+      });
+
+      await service.confirmPayment('fangoo_ref_1');
+
+      const moves = mockPrisma.order.updateMany.mock.calls.map(
+        ([args]: any[]) => `${args.where.status}->${args.data.status}`,
+      );
+      expect(moves).toEqual([
+        'PENDING->PAYMENT_PENDING',
+        'PAYMENT_PENDING->PAID',
+        'PAID->AWAITING_CONFIRMATION',
+      ]);
+    });
+
+    it('should not touch catalogue stock for an RFQ-sourced order', async () => {
+      mockPrisma.payment.findUnique.mockResolvedValue(mockPayment);
+      mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+        ...mockOrder,
+        source: OrderSource.REQUEST,
       });
       mockPaystack.verifyTransaction.mockResolvedValue({
         status: 'success',
@@ -218,7 +357,7 @@ describe('PaymentsService', () => {
 
       // The price was agreed in an offer, not drawn from a published listing.
       expect(mockPrisma.supplierFuel.updateMany).not.toHaveBeenCalled();
-      expect(mockPrisma.order.update).toHaveBeenCalledWith(
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({ status: OrderStatus.PAID }),
         }),
@@ -242,7 +381,7 @@ describe('PaymentsService', () => {
 
       await service.confirmPayment('fangoo_ref_1');
 
-      expect(mockPrisma.payment.update).toHaveBeenCalledWith(
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
             status: PaymentStatus.FAILED,
@@ -251,7 +390,27 @@ describe('PaymentsService', () => {
         }),
       );
       expect(mockPrisma.supplierFuel.updateMany).not.toHaveBeenCalled();
-      expect(mockPrisma.order.update).not.toHaveBeenCalled();
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects the right number of minor units in the wrong currency', async () => {
+      mockPrisma.payment.findUnique.mockResolvedValue(mockPayment);
+      mockPaystack.verifyTransaction.mockResolvedValue({
+        ...successFor('fangoo_ref_1'),
+        currency: 'NGN',
+      });
+
+      await service.confirmPayment('fangoo_ref_1');
+
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: PaymentStatus.FAILED,
+            failureReason: 'Amount paid did not match the order total',
+          }),
+        }),
+      );
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
     });
 
     it('should mark the payment failed when Paystack reports a non-success status', async () => {
@@ -271,14 +430,18 @@ describe('PaymentsService', () => {
 
       await service.confirmPayment('fangoo_ref_1');
 
-      expect(mockPrisma.payment.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({
-            status: PaymentStatus.FAILED,
-            failureReason: 'Declined by bank',
-          }),
+      // Never overwrites a payment a concurrent confirmation has just settled.
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'payment-1',
+          reference: 'fangoo_ref_1',
+          status: { notIn: [PaymentStatus.SUCCESS, PaymentStatus.REFUNDED] },
+        },
+        data: expect.objectContaining({
+          status: PaymentStatus.FAILED,
+          failureReason: 'Declined by bank',
         }),
-      );
+      });
       expect(mockPrisma.supplierFuel.updateMany).not.toHaveBeenCalled();
     });
 
@@ -353,6 +516,98 @@ describe('PaymentsService', () => {
       await expect(
         service.confirmPaymentForCustomer('nope', 'customer-1'),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  /**
+   * Starting checkout again replaces the stored reference. A buyer who then pays
+   * in the tab they opened first used to be charged with the order left unpaid:
+   * the webhook could not find the old reference.
+   */
+  describe('confirmPayment through an older checkout link', () => {
+    const current = { ...mockPayment, reference: 'fangoo_ref_new' };
+
+    beforeEach(() => {
+      mockPrisma.payment.findUnique.mockImplementation(({ where }: any) =>
+        Promise.resolve(where.orderId === 'order-1' ? current : null),
+      );
+    });
+
+    it('matches the payment through the order id Paystack echoes back', async () => {
+      mockPaystack.verifyTransaction.mockResolvedValue(successFor('fangoo_ref_old'));
+
+      const result = await service.confirmPayment('fangoo_ref_old');
+
+      expect(result.alreadyProcessed).toBe(false);
+      expect(mockPaystack.verifyTransaction).toHaveBeenCalledTimes(1);
+      // The reference that was actually paid is kept, because refunds need it.
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: PaymentStatus.SUCCESS,
+            reference: 'fangoo_ref_old',
+          }),
+        }),
+      );
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: OrderStatus.PAID }),
+        }),
+      );
+    });
+
+    it('ignores a failed older link instead of failing the current attempt', async () => {
+      mockPaystack.verifyTransaction.mockResolvedValue({
+        ...successFor('fangoo_ref_old'),
+        status: 'abandoned',
+      });
+
+      const result = await service.confirmPayment('fangoo_ref_old');
+
+      expect(result.payment).toBe(current);
+      expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('still checks the order belongs to the buyer', async () => {
+      mockPaystack.verifyTransaction.mockResolvedValue(successFor('fangoo_ref_old'));
+
+      await expect(
+        service.confirmPaymentForCustomer('fangoo_ref_old', 'someone-else'),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('404s when the transaction carries no order id', async () => {
+      mockPaystack.verifyTransaction.mockResolvedValue({
+        ...successFor('fangoo_ref_old'),
+        orderId: null,
+      });
+
+      await expect(service.confirmPayment('fangoo_ref_old')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('flags a second payment for an order that is already paid', async () => {
+      mockPrisma.payment.findUnique.mockImplementation(({ where }: any) =>
+        Promise.resolve(
+          where.orderId === 'order-1'
+            ? { ...current, status: PaymentStatus.SUCCESS }
+            : null,
+        ),
+      );
+      mockPaystack.verifyTransaction.mockResolvedValue(successFor('fangoo_ref_old'));
+      const logged = vi
+        .spyOn((service as any).logger, 'error')
+        .mockImplementation(() => undefined);
+
+      const result = await service.confirmPayment('fangoo_ref_old');
+
+      expect(result.alreadyProcessed).toBe(true);
+      expect(logged).toHaveBeenCalledWith(
+        expect.stringContaining('refund fangoo_ref_old manually'),
+      );
+      expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
     });
   });
 
@@ -451,11 +706,6 @@ describe('PaymentsService', () => {
 
     beforeEach(() => {
       mockPrisma.payment.findUnique.mockResolvedValue(paidPayment);
-      mockPrisma.payment.update.mockResolvedValue({});
-      mockPrisma.order.update.mockResolvedValue({
-        id: 'order-1',
-        status: OrderStatus.REFUNDED,
-      });
     });
 
     it('refunds through the provider and closes the order out', async () => {
@@ -466,16 +716,16 @@ describe('PaymentsService', () => {
         '182.50',
         'Depot out of stock',
       );
-      expect(mockPrisma.payment.update).toHaveBeenCalledWith(
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
+          where: { id: 'pay-1', status: PaymentStatus.SUCCESS },
           data: expect.objectContaining({ status: PaymentStatus.REFUNDED }),
         }),
       );
-      expect(mockPrisma.order.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: { status: OrderStatus.REFUNDED },
-        }),
-      );
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: 'order-1', status: OrderStatus.REFUND_PENDING },
+        data: { status: OrderStatus.REFUNDED },
+      });
       expect(result.status).toBe(OrderStatus.REFUNDED);
       expect(result.providerRefundId).toBe(77);
     });
@@ -506,8 +756,17 @@ describe('PaymentsService', () => {
         BadRequestException,
       );
 
-      expect(mockPrisma.payment.update).not.toHaveBeenCalled();
-      expect(mockPrisma.order.update).not.toHaveBeenCalled();
+      expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('records nothing twice when two admins refund at the same moment', async () => {
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.refundOrder('order-1')).rejects.toThrow(
+        'This payment has already been refunded',
+      );
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
     });
 
     it('refuses to refund the same payment twice', async () => {

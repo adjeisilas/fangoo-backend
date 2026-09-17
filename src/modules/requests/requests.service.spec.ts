@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ForbiddenException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import { RequestsService } from './requests.service.js';
 import {
@@ -64,6 +65,7 @@ describe('RequestsService', () => {
           .fn()
           .mockResolvedValue({ deliveryFee: new Prisma.Decimal(500) }),
         findMany: vi.fn().mockResolvedValue([{ deliveryAreaId: 'area-1' }]),
+        count: vi.fn().mockResolvedValue(1),
       },
       fuelRequest: {
         // Shaped like the real `REQUEST_INCLUDE` result, because the created
@@ -79,13 +81,20 @@ describe('RequestsService', () => {
         findUnique: vi.fn(),
         findMany: vi.fn(),
         update: vi.fn().mockResolvedValue({ id: 'request-1' }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
       offer: {
         findUnique: vi.fn().mockResolvedValue(null),
         findMany: vi.fn(),
-        // Mirrors the real include, which carries the request and its fuel type.
-        upsert: vi.fn().mockResolvedValue({
+        create: vi.fn().mockResolvedValue({ id: 'offer-1' }),
+        // Read back after a bid (with its request) and after an award is locked.
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
           id: 'offer-1',
+          supplierProfileId: 'supplier-1',
+          pricePerLitre: new Prisma.Decimal(1),
+          deliveryFee: new Prisma.Decimal(0),
+          subtotal: new Prisma.Decimal(100),
+          totalAmount: new Prisma.Decimal(100),
           request: { fuelType: { name: 'Diesel (AGO)' } },
         }),
         update: vi.fn().mockResolvedValue({ id: 'offer-1' }),
@@ -325,7 +334,7 @@ describe('RequestsService', () => {
         availableQuantity: 50000,
       });
 
-      const data = mockPrisma.offer.upsert.mock.calls[0][0].create;
+      const data = mockPrisma.offer.create.mock.calls[0][0].data;
       // 12.40 × 30,000 requested = 372,000  (+500 delivery)
       expect(data.subtotal.toString()).toBe('372000');
       expect(data.totalAmount.toString()).toBe('372500');
@@ -370,6 +379,51 @@ describe('RequestsService', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
+    /**
+     * Regression: a revision was an unconditional upsert, so a price change landing
+     * as the buyer accepted flipped the accepted offer back to PENDING.
+     */
+    it('revises a bid only while the request is open and the bid not accepted', async () => {
+      mockPrisma.offer.findUnique.mockResolvedValue({
+        id: 'offer-1',
+        status: OfferStatus.PENDING,
+      });
+
+      await service.submitOffer('request-1', 'supplier-user-1', offerDto);
+
+      expect(mockPrisma.offer.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'offer-1',
+          status: { not: OfferStatus.ACCEPTED },
+          request: { status: RequestStatus.OPEN },
+        },
+        data: expect.objectContaining({ status: OfferStatus.PENDING }),
+      });
+      expect(mockPrisma.offer.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses a revision that lost the race to an award', async () => {
+      mockPrisma.offer.findUnique.mockResolvedValue({
+        id: 'offer-1',
+        status: OfferStatus.PENDING,
+      });
+      mockPrisma.offer.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.submitOffer('request-1', 'supplier-user-1', offerDto),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('turns two simultaneous first bids into a conflict, not a crash', async () => {
+      mockPrisma.offer.create.mockRejectedValue(
+        Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }),
+      );
+
+      await expect(
+        service.submitOffer('request-1', 'supplier-user-1', offerDto),
+      ).rejects.toThrow(ConflictException);
+    });
+
     it('refuses bidding on your own request', async () => {
       mockPrisma.fuelRequest.findUnique.mockResolvedValue({
         ...openRequest,
@@ -398,6 +452,7 @@ describe('RequestsService', () => {
         ...openRequest,
         offers: [offer, { id: 'offer-2', status: OfferStatus.PENDING }],
       });
+      mockPrisma.offer.findUniqueOrThrow.mockResolvedValue(offer);
     });
 
     it('creates an RFQ-sourced order at the agreed price', async () => {
@@ -419,8 +474,12 @@ describe('RequestsService', () => {
     it('accepts the winner, rejects every rival, and closes the request', async () => {
       await service.acceptOffer('request-1', 'offer-1', 'buyer-1');
 
-      expect(mockPrisma.offer.update).toHaveBeenCalledWith({
-        where: { id: 'offer-1' },
+      expect(mockPrisma.fuelRequest.updateMany).toHaveBeenCalledWith({
+        where: { id: 'request-1', status: RequestStatus.OPEN },
+        data: { status: RequestStatus.AWARDED },
+      });
+      expect(mockPrisma.offer.updateMany).toHaveBeenCalledWith({
+        where: { id: 'offer-1', requestId: 'request-1', status: OfferStatus.PENDING },
         data: { status: OfferStatus.ACCEPTED },
       });
       expect(mockPrisma.offer.updateMany).toHaveBeenCalledWith({
@@ -433,7 +492,7 @@ describe('RequestsService', () => {
       });
       expect(mockPrisma.fuelRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: { status: RequestStatus.AWARDED, orderId: 'order-1' },
+          data: { orderId: 'order-1' },
         }),
       );
     });
@@ -458,6 +517,46 @@ describe('RequestsService', () => {
       expect(mockPrisma.order.create).not.toHaveBeenCalled();
     });
 
+    /**
+     * Regression: both checks ran on a snapshot, so two clicks at the same moment
+     * each created an order for one request.
+     */
+    it('creates no order when a concurrent award already closed the request', async () => {
+      mockPrisma.fuelRequest.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.acceptOffer('request-1', 'offer-1', 'buyer-1'),
+      ).rejects.toThrow(ConflictException);
+      expect(mockPrisma.order.create).not.toHaveBeenCalled();
+      expect(mockNotifications.notify).not.toHaveBeenCalled();
+    });
+
+    it('creates no order when the offer was withdrawn meanwhile', async () => {
+      mockPrisma.offer.updateMany.mockResolvedValueOnce({ count: 0 });
+
+      await expect(
+        service.acceptOffer('request-1', 'offer-1', 'buyer-1'),
+      ).rejects.toThrow('That offer is no longer available');
+      expect(mockPrisma.order.create).not.toHaveBeenCalled();
+    });
+
+    it('prices the order from the offer as locked, not as first read', async () => {
+      mockPrisma.offer.findUniqueOrThrow.mockResolvedValue({
+        ...offer,
+        totalAmount: new Prisma.Decimal(360500),
+      });
+
+      await service.acceptOffer('request-1', 'offer-1', 'buyer-1');
+
+      expect(mockPrisma.order.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            totalAmount: new Prisma.Decimal(360500),
+          }),
+        }),
+      );
+    });
+
     it('refuses an offer that belongs to another request', async () => {
       await expect(
         service.acceptOffer('request-1', 'offer-from-elsewhere', 'buyer-1'),
@@ -468,6 +567,12 @@ describe('RequestsService', () => {
   describe('getRequestById', () => {
     const withRivalOffers = {
       ...openRequest,
+      buyer: {
+        id: 'buyer-1',
+        firstName: 'Ama',
+        lastName: 'Mensah',
+        email: 'ama@example.com',
+      },
       offers: [
         { id: 'offer-1', supplierProfileId: 'supplier-1' },
         { id: 'offer-2', supplierProfileId: 'supplier-2' },
@@ -484,6 +589,7 @@ describe('RequestsService', () => {
       );
 
       expect(result.offers).toHaveLength(2);
+      expect(result.buyer).toHaveProperty('email', 'ama@example.com');
     });
 
     it('never leaks a rival bid to a competing supplier', async () => {
@@ -497,6 +603,95 @@ describe('RequestsService', () => {
 
       expect(result.offers).toHaveLength(1);
       expect(result.offers[0]!.supplierProfileId).toBe('supplier-1');
+    });
+
+    it('never gives a supplier the buyer’s email', async () => {
+      mockPrisma.fuelRequest.findUnique.mockResolvedValue(withRivalOffers);
+
+      const result = await service.getRequestById(
+        'request-1',
+        'supplier-user-1',
+        Role.SUPPLIER,
+      );
+
+      expect(result.buyer).toEqual({ id: 'buyer-1', firstName: 'Ama', lastName: 'Mensah' });
+    });
+
+    it('lets a supplier that could bid read an open request it has not bid on', async () => {
+      mockPrisma.fuelRequest.findUnique.mockResolvedValue({
+        ...withRivalOffers,
+        offers: [{ id: 'offer-2', supplierProfileId: 'supplier-2' }],
+      });
+
+      const result = await service.getRequestById(
+        'request-1',
+        'supplier-user-1',
+        Role.SUPPLIER,
+      );
+
+      expect(result.offers).toEqual([]);
+      expect(mockPrisma.supplierDeliveryArea.count).toHaveBeenCalledWith({
+        where: { supplierProfileId: 'supplier-1', deliveryAreaId: 'area-1' },
+      });
+    });
+
+    /**
+     * Regression: any account with a supplier profile — even an unverified one
+     * with no coverage — could read any request, buyer email included.
+     */
+    it.each([
+      ['does not cover the area', () => mockPrisma.supplierDeliveryArea.count.mockResolvedValue(0)],
+      [
+        'is not verified',
+        () =>
+          mockPrisma.supplierProfile.findUnique.mockResolvedValue({
+            ...supplier,
+            verificationStatus: VerificationStatus.PENDING,
+          }),
+      ],
+      [
+        'is not accepting orders',
+        () =>
+          mockPrisma.supplierProfile.findUnique.mockResolvedValue({
+            ...supplier,
+            isAcceptingOrders: false,
+          }),
+      ],
+      [
+        'is looking at a closed request',
+        () =>
+          mockPrisma.fuelRequest.findUnique.mockResolvedValue({
+            ...withRivalOffers,
+            status: RequestStatus.AWARDED,
+            offers: [],
+          }),
+      ],
+    ])('refuses a supplier that has not bid and %s', async (_case, arrange) => {
+      mockPrisma.fuelRequest.findUnique.mockResolvedValue({
+        ...withRivalOffers,
+        offers: [],
+      });
+      arrange();
+
+      await expect(
+        service.getRequestById('request-1', 'supplier-user-1', Role.SUPPLIER),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('still lets a supplier read a closed request it bid on', async () => {
+      mockPrisma.fuelRequest.findUnique.mockResolvedValue({
+        ...withRivalOffers,
+        status: RequestStatus.AWARDED,
+      });
+      mockPrisma.supplierDeliveryArea.count.mockResolvedValue(0);
+
+      const result = await service.getRequestById(
+        'request-1',
+        'supplier-user-1',
+        Role.SUPPLIER,
+      );
+
+      expect(result.offers).toHaveLength(1);
     });
 
     it('refuses a stranger with no supplier profile', async () => {

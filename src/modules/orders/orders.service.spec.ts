@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ForbiddenException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import { OrdersService } from './orders.service.js';
 import {
@@ -29,6 +30,7 @@ describe('OrdersService', () => {
     supplierProfileId: 'supplier-1',
     deliveryAreaId: 'area-1',
     deliveryFee: new Prisma.Decimal(10),
+    deliveryArea: { isActive: true },
   };
 
   const mockListing = {
@@ -59,6 +61,7 @@ describe('OrdersService', () => {
         findMany: vi.fn(),
         findUnique: vi.fn(),
         update: vi.fn(),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
       orderStatusHistory: {
         create: vi.fn(),
@@ -110,6 +113,50 @@ describe('OrdersService', () => {
           toStatus: OrderStatus.PENDING,
         },
       });
+    });
+
+    /** A paused area keeps its existing orders but takes no new ones. */
+    it('should refuse an order to a paused delivery area', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockSupplier);
+      mockPrisma.supplierDeliveryArea.findUnique.mockResolvedValue({
+        ...mockCoverage,
+        deliveryArea: { isActive: false },
+      });
+
+      await expect(service.createOrder('customer-1', dto)).rejects.toThrow(
+        new NotFoundException('Delivery area not available'),
+      );
+      expect(mockPrisma.supplierFuel.findMany).not.toHaveBeenCalled();
+      expect(mockPrisma.order.create).not.toHaveBeenCalled();
+    });
+
+    it('should look up whether the delivery area is active', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockSupplier);
+      mockPrisma.supplierDeliveryArea.findUnique.mockResolvedValue(mockCoverage);
+      mockPrisma.supplierFuel.findMany.mockResolvedValue([mockListing]);
+      mockPrisma.order.create.mockResolvedValue({ id: 'order-1' });
+
+      await service.createOrder('customer-1', dto);
+
+      expect(mockPrisma.supplierDeliveryArea.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: { deliveryArea: { select: { isActive: true } } },
+        }),
+      );
+    });
+
+    /**
+     * Without this, the owner becomes the CUSTOMER of their own order, so no one
+     * is left who may confirm it — and the buyer has already paid by then.
+     */
+    it('should refuse an order placed on the buyer’s own depot', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockSupplier);
+
+      await expect(
+        service.createOrder(mockSupplier.userId, dto),
+      ).rejects.toThrow(ForbiddenException);
+
+      expect(mockPrisma.order.create).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundException when the supplier does not exist', async () => {
@@ -370,8 +417,10 @@ describe('OrdersService', () => {
         Role.SUPPLIER,
       );
 
-      expect(mockPrisma.order.update).toHaveBeenCalledWith(
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
+          // Only applied if the order is still where it was read.
+          where: { id: 'order-1', status: OrderStatus.AWAITING_CONFIRMATION },
           data: expect.objectContaining({
             status: OrderStatus.CONFIRMED,
             confirmedAt: expect.any(Date),
@@ -403,8 +452,9 @@ describe('OrdersService', () => {
         Role.CUSTOMER,
       );
 
-      expect(mockPrisma.order.update).toHaveBeenCalledWith(
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
+          where: { id: 'order-1', status: OrderStatus.OUT_FOR_DELIVERY },
           data: expect.objectContaining({
             status: OrderStatus.DELIVERED,
             deliveredAt: expect.any(Date),
@@ -477,6 +527,63 @@ describe('OrdersService', () => {
       );
 
       expect(mockPrisma.supplierFuel.updateMany).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Regression: the state was checked on a snapshot and then written blindly,
+     * so a double-clicked rejection restored the same stock twice, and a
+     * cancellation could overwrite a payment that had just landed.
+     */
+    it('changes nothing when the order moved after it was read', async () => {
+      mockOrderAt(OrderStatus.AWAITING_CONFIRMATION);
+      mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 0 });
+
+      await expect(
+        service.updateOrderStatus(
+          'order-1',
+          OrderStatus.REJECTED,
+          'supplier-user-1',
+          Role.SUPPLIER,
+        ),
+      ).rejects.toThrow(ConflictException);
+
+      expect(mockPrisma.supplierFuel.updateMany).not.toHaveBeenCalled();
+      expect(mockPrisma.orderStatusHistory.create).not.toHaveBeenCalled();
+      expect(mockNotifications.notify).not.toHaveBeenCalled();
+    });
+
+    it('restores stock only after the rejection has been claimed', async () => {
+      mockOrderAt(OrderStatus.AWAITING_CONFIRMATION);
+
+      await service.updateOrderStatus(
+        'order-1',
+        OrderStatus.REJECTED,
+        'supplier-user-1',
+        Role.SUPPLIER,
+      );
+
+      const claimedAt = mockPrisma.order.updateMany.mock.invocationCallOrder[0];
+      const restoredAt = mockPrisma.supplierFuel.updateMany.mock.invocationCallOrder[0];
+      expect(claimedAt).toBeLessThan(restoredAt);
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ inventoryDeducted: false }),
+        }),
+      );
+    });
+
+    it('never lets anyone push a cancelled order into a refund by hand', async () => {
+      mockOrderAt(OrderStatus.CANCELLED);
+
+      await expect(
+        service.updateOrderStatus(
+          'order-1',
+          OrderStatus.REFUND_PENDING,
+          'admin-1',
+          Role.ADMIN,
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
     });
 
     it('should only let an admin complete a refund', async () => {

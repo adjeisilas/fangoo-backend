@@ -20,10 +20,11 @@ import {
 } from '../../generated/prisma/client.js';
 import { CreateRequestDto } from './dto/create-request.dto.js';
 import { CreateOfferDto } from './dto/create-offer.dto.js';
+import { DELIVERY_AREA_WITH_REGION } from '../delivery-areas/delivery-area.query.js';
 
 const REQUEST_INCLUDE = {
   fuelType: true,
-  deliveryArea: true,
+  deliveryArea: DELIVERY_AREA_WITH_REGION,
   buyer: { select: { id: true, firstName: true, lastName: true, email: true } },
   offers: {
     include: {
@@ -212,7 +213,7 @@ export class RequestsService {
       },
       include: {
         fuelType: true,
-        deliveryArea: true,
+        deliveryArea: DELIVERY_AREA_WITH_REGION,
         buyer: { select: { firstName: true, lastName: true } },
         // Only this supplier's own bid is visible — never a rival's price.
         offers: {
@@ -296,16 +297,17 @@ export class RequestsService {
       status: OfferStatus.PENDING,
     };
 
-    const offer = await this.prisma.offer.upsert({
-      where: {
-        requestId_supplierProfileId: {
-          requestId,
-          supplierProfileId: supplier.id,
+    const offerId = existing
+      ? await this.reviseOffer(existing.id, data)
+      : await this.createOffer({ requestId, supplierProfileId: supplier.id, ...data });
+
+    const offer = await this.prisma.offer.findUniqueOrThrow({
+      where: { id: offerId },
+      include: {
+        request: {
+          include: { fuelType: true, deliveryArea: DELIVERY_AREA_WITH_REGION },
         },
       },
-      create: { requestId, supplierProfileId: supplier.id, ...data },
-      update: data,
-      include: { request: { include: { fuelType: true, deliveryArea: true } } },
     });
 
     // Only on a first bid: a supplier revising its price should not re-notify.
@@ -329,6 +331,51 @@ export class RequestsService {
     return offer;
   }
 
+  /**
+   * A revision only lands while the request is still open and this offer has not
+   * been accepted. Checked in the write itself, so an award happening at the same
+   * moment cannot be undone by a price change.
+   */
+  private async reviseOffer(
+    offerId: string,
+    data: Prisma.OfferUpdateManyMutationInput,
+  ): Promise<string> {
+    const revised = await this.prisma.offer.updateMany({
+      where: {
+        id: offerId,
+        status: { not: OfferStatus.ACCEPTED },
+        request: { status: RequestStatus.OPEN },
+      },
+      data,
+    });
+
+    if (revised.count === 0) {
+      throw new ConflictException('This request is no longer accepting offers');
+    }
+
+    return offerId;
+  }
+
+  /** A first bid. Two submitted at once both miss the lookup; the unique index stops one. */
+  private async createOffer(
+    data: Prisma.OfferUncheckedCreateInput,
+  ): Promise<string> {
+    try {
+      const created = await this.prisma.offer.create({
+        data,
+        select: { id: true },
+      });
+      return created.id;
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code === 'P2002') {
+        throw new ConflictException(
+          'Your offer is already being submitted. Refresh to see it.',
+        );
+      }
+      throw err;
+    }
+  }
+
   async getMyOffers(userId: string) {
     const supplier = await this.requireSupplierProfile(userId);
 
@@ -338,7 +385,7 @@ export class RequestsService {
         request: {
           include: {
             fuelType: true,
-            deliveryArea: true,
+            deliveryArea: DELIVERY_AREA_WITH_REGION,
             buyer: { select: { firstName: true, lastName: true } },
           },
         },
@@ -404,15 +451,39 @@ export class RequestsService {
     }
 
     const awarded = await this.prisma.$transaction(async (tx) => {
+      // The checks above ran on a snapshot. These two claims are what actually
+      // guarantee one award: the request must still be open and the offer still
+      // pending (not withdrawn, not awarded by a concurrent click).
+      const closed = await tx.fuelRequest.updateMany({
+        where: { id: requestId, status: RequestStatus.OPEN },
+        data: { status: RequestStatus.AWARDED },
+      });
+
+      if (closed.count === 0) {
+        throw new ConflictException('This request has already been closed');
+      }
+
+      const taken = await tx.offer.updateMany({
+        where: { id: offerId, requestId, status: OfferStatus.PENDING },
+        data: { status: OfferStatus.ACCEPTED },
+      });
+
+      if (taken.count === 0) {
+        throw new ConflictException('That offer is no longer available');
+      }
+
+      // Priced from the offer as it stands now that it is locked, not as first read.
+      const locked = await tx.offer.findUniqueOrThrow({ where: { id: offerId } });
+
       const order = await tx.order.create({
         data: {
           customerId: buyerId,
-          supplierProfileId: offer.supplierProfileId,
+          supplierProfileId: locked.supplierProfileId,
           deliveryAreaId: request.deliveryAreaId,
           deliveryAddress: request.deliveryAddress,
-          deliveryFee: offer.deliveryFee,
-          subtotal: offer.subtotal,
-          totalAmount: offer.totalAmount,
+          deliveryFee: locked.deliveryFee,
+          subtotal: locked.subtotal,
+          totalAmount: locked.totalAmount,
           status: OrderStatus.PENDING,
           // Marks this order as RFQ-sourced so payment skips catalogue stock.
           source: OrderSource.REQUEST,
@@ -420,9 +491,9 @@ export class RequestsService {
             create: [
               {
                 fuelTypeId: request.fuelTypeId,
-                pricePerLitre: offer.pricePerLitre,
+                pricePerLitre: locked.pricePerLitre,
                 quantity: request.quantityLitres,
-                lineTotal: offer.subtotal,
+                lineTotal: locked.subtotal,
               },
             ],
           },
@@ -438,11 +509,6 @@ export class RequestsService {
         },
       });
 
-      await tx.offer.update({
-        where: { id: offerId },
-        data: { status: OfferStatus.ACCEPTED },
-      });
-
       await tx.offer.updateMany({
         where: { requestId, id: { not: offerId }, status: OfferStatus.PENDING },
         data: { status: OfferStatus.REJECTED },
@@ -450,19 +516,19 @@ export class RequestsService {
 
       await tx.fuelRequest.update({
         where: { id: requestId },
-        data: { status: RequestStatus.AWARDED, orderId: order.id },
+        data: { orderId: order.id },
       });
 
-      return { order, offerId };
+      return { order, offerId, winning: locked };
     });
 
     // After the transaction commits, never inside it: telling people is not
     // allowed to roll back an award.
     await this.announce('award', () =>
-      this.announceAward(request, offer, awarded.order.id),
+      this.announceAward(request, awarded.winning, awarded.order.id),
     );
 
-    return awarded;
+    return { order: awarded.order, offerId: awarded.offerId };
   }
 
   /** Both outcomes get said out loud — losing a bid silently is worse than losing it. */
@@ -537,21 +603,36 @@ export class RequestsService {
       return request;
     }
 
-    // A bidding supplier may read the brief, but never rival bids.
+    // A supplier may read the brief if it has bid on it, or could bid on it now —
+    // the same rule as the open-requests feed. Never rival bids, and never the
+    // buyer's contact details, which only the buyer and admins see.
     const supplier = await this.prisma.supplierProfile.findUnique({
       where: { userId },
     });
 
-    if (!supplier) {
+    const ownOffers = supplier
+      ? request.offers.filter((offer) => offer.supplierProfileId === supplier.id)
+      : [];
+
+    const mayBid =
+      supplier !== null &&
+      request.status === RequestStatus.OPEN &&
+      supplier.verificationStatus === VerificationStatus.VERIFIED &&
+      supplier.isAcceptingOrders &&
+      (await this.prisma.supplierDeliveryArea.count({
+        where: {
+          supplierProfileId: supplier.id,
+          deliveryAreaId: request.deliveryAreaId,
+        },
+      })) > 0;
+
+    if (ownOffers.length === 0 && !mayBid) {
       throw new ForbiddenException('You do not have access to this request');
     }
 
-    return {
-      ...request,
-      offers: request.offers.filter(
-        (offer) => offer.supplierProfileId === supplier.id,
-      ),
-    };
+    const { email: _email, ...buyer } = request.buyer;
+
+    return { ...request, buyer, offers: ownOffers };
   }
 
   async listAllForAdmin(status?: RequestStatus) {

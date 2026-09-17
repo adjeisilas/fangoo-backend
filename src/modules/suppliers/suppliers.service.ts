@@ -6,6 +6,18 @@ import { UpdateSupplierProfileDto } from './dto/update-supplier-profile.dto.js';
 import { DeliveryAreaAssignmentDto } from './dto/configure-delivery-areas.dto.js';
 import { UpsertFuelListingDto } from './dto/upsert-fuel-listing.dto.js';
 import { UpdateFuelListingDto } from './dto/update-fuel-listing.dto.js';
+import {
+  DELIVERY_AREA_WITH_REGION,
+  REGION_SUMMARY_SELECT,
+} from '../delivery-areas/delivery-area.query.js';
+import {
+  reverificationFor,
+  toSupplierProfileData,
+} from './supplier-profile-data.js';
+import {
+  assertDeliveryAreasAvailable,
+  toCoverageRows,
+} from './supplier-coverage.js';
 
 @Injectable()
 export class SuppliersService {
@@ -28,17 +40,10 @@ export class SuppliersService {
       });
     }
 
-    const profileData = {
-      companyName: dto.companyName.trim(),
-      businessRegNumber: dto.businessRegNumber?.trim() || null,
-      taxId: dto.taxId?.trim() || null,
-      description: dto.description?.trim() || null,
-      address: dto.address.trim(),
-      city: dto.city.trim(),
-      postalCode: dto.postalCode?.trim() || null,
-      contactPhone: dto.contactPhone.trim(),
-      contactEmail: dto.contactEmail.toLowerCase().trim(),
-    };
+    const profileData = toSupplierProfileData(dto);
+    const existing = await this.prisma.supplierProfile.findUnique({
+      where: { userId },
+    });
 
     return this.prisma.supplierProfile.upsert({
       where: { userId },
@@ -47,11 +52,14 @@ export class SuppliersService {
         ...profileData,
         verificationStatus: VerificationStatus.PENDING,
       },
-      update: profileData,
+      update: {
+        ...profileData,
+        ...(existing ? reverificationFor(existing, profileData) : {}),
+      },
       include: {
         deliveryAreas: {
           include: {
-            deliveryArea: true,
+            deliveryArea: DELIVERY_AREA_WITH_REGION,
           },
         },
       },
@@ -88,11 +96,11 @@ export class SuppliersService {
 
     return this.prisma.supplierProfile.update({
       where: { userId },
-      data: dataToUpdate,
+      data: { ...dataToUpdate, ...reverificationFor(profile, dataToUpdate) },
       include: {
         deliveryAreas: {
           include: {
-            deliveryArea: true,
+            deliveryArea: DELIVERY_AREA_WITH_REGION,
           },
         },
       },
@@ -105,7 +113,7 @@ export class SuppliersService {
       include: {
         deliveryAreas: {
           include: {
-            deliveryArea: true,
+            deliveryArea: DELIVERY_AREA_WITH_REGION,
           },
         },
       },
@@ -130,32 +138,22 @@ export class SuppliersService {
       throw new NotFoundException('Supplier profile not found');
     }
 
-    // Verify all specified delivery area IDs exist
-    const areaIds = areas.map((a) => a.deliveryAreaId);
-    if (areaIds.length > 0) {
-      const existingCount = await this.prisma.deliveryArea.count({
-        where: { id: { in: areaIds } },
-      });
-      if (existingCount !== areaIds.length) {
-        throw new NotFoundException(
-          'One or more delivery area IDs are invalid',
-        );
-      }
-    }
+    await assertDeliveryAreasAvailable(this.prisma, areas);
 
     return this.prisma.$transaction(async (tx) => {
+      // Only active areas are replaced. Coverage of a paused area cannot be
+      // chosen on the coverage page, so a save must not silently drop it; it
+      // resumes as it was if the area is reactivated.
       await tx.supplierDeliveryArea.deleteMany({
-        where: { supplierProfileId: profile.id },
+        where: {
+          supplierProfileId: profile.id,
+          deliveryArea: { isActive: true },
+        },
       });
 
       if (areas.length > 0) {
         await tx.supplierDeliveryArea.createMany({
-          data: areas.map((a) => ({
-            supplierProfileId: profile.id,
-            deliveryAreaId: a.deliveryAreaId,
-            deliveryFee: a.deliveryFee ?? 0,
-            estimatedDeliveryHours: a.estimatedDeliveryHours ?? null,
-          })),
+          data: toCoverageRows(profile.id, areas),
         });
       }
 
@@ -164,7 +162,7 @@ export class SuppliersService {
         include: {
           deliveryAreas: {
             include: {
-              deliveryArea: true,
+              deliveryArea: DELIVERY_AREA_WITH_REGION,
             },
           },
         },
@@ -316,7 +314,7 @@ export class SuppliersService {
 
     if (deliveryAreaId) {
       where.deliveryAreas = {
-        some: { deliveryAreaId },
+        some: { deliveryAreaId, deliveryArea: { isActive: true } },
       };
     }
 
@@ -339,6 +337,8 @@ export class SuppliersService {
         isAcceptingOrders: true,
         verificationStatus: true,
         deliveryAreas: {
+          // A paused area takes no new orders, so buyers are never offered it.
+          where: { deliveryArea: { isActive: true } },
           select: {
             deliveryFee: true,
             estimatedDeliveryHours: true,
@@ -347,7 +347,7 @@ export class SuppliersService {
                 id: true,
                 name: true,
                 city: true,
-                region: true,
+                region: { select: REGION_SUMMARY_SELECT },
               },
             },
           },
@@ -401,6 +401,8 @@ export class SuppliersService {
         isAcceptingOrders: true,
         verificationStatus: true,
         deliveryAreas: {
+          // A paused area takes no new orders, so buyers are never offered it.
+          where: { deliveryArea: { isActive: true } },
           select: {
             deliveryFee: true,
             estimatedDeliveryHours: true,
@@ -409,7 +411,7 @@ export class SuppliersService {
                 id: true,
                 name: true,
                 city: true,
-                region: true,
+                region: { select: REGION_SUMMARY_SELECT },
               },
             },
           },
@@ -524,7 +526,7 @@ export class SuppliersService {
         },
         deliveryAreas: {
           include: {
-            deliveryArea: true,
+            deliveryArea: DELIVERY_AREA_WITH_REGION,
           },
         },
       },

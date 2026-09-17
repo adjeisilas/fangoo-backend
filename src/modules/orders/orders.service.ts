@@ -4,6 +4,7 @@ import {
   NotFoundException,
   ForbiddenException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
@@ -21,11 +22,12 @@ import {
   type OrderActor,
 } from '../../common/constants/order-status-transitions.js';
 import { CreateOrderDto } from './dto/create-order.dto.js';
+import { DELIVERY_AREA_WITH_REGION } from '../delivery-areas/delivery-area.query.js';
 
 const ORDER_INCLUDE = {
   items: { include: { fuelType: true } },
   supplier: { select: { id: true, companyName: true, userId: true } },
-  deliveryArea: true,
+  deliveryArea: DELIVERY_AREA_WITH_REGION,
 } satisfies Prisma.OrderInclude;
 
 @Injectable()
@@ -103,6 +105,17 @@ export class OrdersService {
       throw new NotFoundException('Supplier not found');
     }
 
+    /*
+     * Ordering from your own depot strands the order. `resolveActor` matches the
+     * customer first, so the owner is the CUSTOMER of their own order and nobody
+     * is left who may confirm it — after the buyer has already paid. Beyond that,
+     * self-purchases would inflate a supplier's own order count and revenue, and
+     * the confirm/deliver handshake means nothing when one person is both sides.
+     */
+    if (supplier.userId === customerId) {
+      throw new ForbiddenException('You cannot order from your own depot');
+    }
+
     if (
       supplier.verificationStatus !== VerificationStatus.VERIFIED ||
       !supplier.isAcceptingOrders
@@ -119,12 +132,19 @@ export class OrdersService {
           deliveryAreaId: dto.deliveryAreaId,
         },
       },
+      include: { deliveryArea: { select: { isActive: true } } },
     });
 
     if (!coverage) {
       throw new NotFoundException(
         'This supplier does not deliver to the selected area',
       );
+    }
+
+    // A paused area keeps its existing orders but takes no new ones — the same
+    // message a buyer gets when posting a request there.
+    if (!coverage.deliveryArea.isActive) {
+      throw new NotFoundException('Delivery area not available');
     }
 
     const fuelTypeIds = dto.items.map((item) => item.fuelTypeId);
@@ -338,7 +358,7 @@ export class OrdersService {
     const trimmedReason = reason?.trim() || null;
 
     const updated = await this.prisma.$transaction(async (tx) => {
-      const data: Prisma.OrderUpdateInput = { status: target };
+      const data: Prisma.OrderUpdateManyMutationInput = { status: target };
 
       if (target === OrderStatus.CONFIRMED) {
         data.confirmedAt = new Date();
@@ -352,25 +372,41 @@ export class OrdersService {
         data.cancellationReason = trimmedReason;
       }
 
+      const restoresStock =
+        target === OrderStatus.REJECTED && order.inventoryDeducted;
+
       if (target === OrderStatus.REJECTED) {
         data.rejectionReason = trimmedReason;
-
-        // The sale did not happen — put back exactly what payment confirmation took.
-        if (order.inventoryDeducted) {
-          for (const item of order.items) {
-            await tx.supplierFuel.updateMany({
-              where: {
-                supplierProfileId: order.supplierProfileId,
-                fuelTypeId: item.fuelTypeId,
-              },
-              data: { availableQuantity: { increment: item.quantity } },
-            });
-          }
-          data.inventoryDeducted = false;
-        }
+        if (restoresStock) data.inventoryDeducted = false;
       }
 
-      await tx.order.update({ where: { id: orderId }, data });
+      // Everything above was checked against the order as it was read. Apply the
+      // change only if it is still in that state: a double-click, two people
+      // acting at once, or a payment landing mid-cancel must not apply twice or
+      // overwrite each other.
+      const claimed = await tx.order.updateMany({
+        where: { id: orderId, status: order.status },
+        data,
+      });
+
+      if (claimed.count === 0) {
+        throw new ConflictException(
+          'This order was updated by someone else. Refresh and try again.',
+        );
+      }
+
+      // The sale did not happen — put back exactly what payment confirmation took.
+      if (restoresStock) {
+        for (const item of order.items) {
+          await tx.supplierFuel.updateMany({
+            where: {
+              supplierProfileId: order.supplierProfileId,
+              fuelTypeId: item.fuelTypeId,
+            },
+            data: { availableQuantity: { increment: item.quantity } },
+          });
+        }
+      }
 
       await tx.orderStatusHistory.create({
         data: {

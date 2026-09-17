@@ -17,7 +17,10 @@ export const ORDER_STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   [OrderStatus.PREPARING]: [OrderStatus.OUT_FOR_DELIVERY],
   [OrderStatus.OUT_FOR_DELIVERY]: [OrderStatus.DELIVERED],
   [OrderStatus.DELIVERED]: [],
-  [OrderStatus.CANCELLED]: [],
+  // Cancelling does not close a checkout link the buyer already opened. If they
+  // pay through it anyway, the payment flow moves the order here so the money can
+  // be returned. System-driven only: no actor may request it (see below).
+  [OrderStatus.CANCELLED]: [OrderStatus.REFUND_PENDING],
   [OrderStatus.REJECTED]: [OrderStatus.REFUND_PENDING],
   [OrderStatus.REFUND_PENDING]: [OrderStatus.REFUNDED],
   [OrderStatus.REFUNDED]: [],

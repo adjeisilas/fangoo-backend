@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { SuppliersService } from './suppliers.service.js';
 import { Role, VerificationStatus } from '../../generated/prisma/client.js';
 
@@ -42,7 +42,7 @@ describe('SuppliersService', () => {
         upsert: vi.fn(),
       },
       deliveryArea: {
-        count: vi.fn(),
+        findMany: vi.fn(),
       },
       supplierDeliveryArea: {
         deleteMany: vi.fn(),
@@ -97,6 +97,99 @@ describe('SuppliersService', () => {
           contactEmail: 'test@example.com',
         }),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  /**
+   * Regression: a verified depot could rename itself, or swap its registration
+   * number or tax ID, and keep the badge an admin gave a different business.
+   */
+  describe('re-verification after identity changes', () => {
+    const verified = {
+      ...mockProfile,
+      taxId: 'TIN-1',
+      verificationStatus: VerificationStatus.VERIFIED,
+    };
+    const backToReview = {
+      verificationStatus: VerificationStatus.PENDING,
+      verifiedAt: null,
+    };
+    const updateData = () => mockPrisma.supplierProfile.update.mock.calls[0][0].data;
+
+    beforeEach(() => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(verified);
+    });
+
+    it.each([
+      ['company name', { companyName: 'Other Fuels Ltd' }],
+      ['registration number', { businessRegNumber: 'BN999' }],
+      ['tax ID', { taxId: 'TIN-2' }],
+    ])('sends a verified depot back to review when its %s changes', async (_field, dto) => {
+      await service.updateProfile('user-supplier-1', dto);
+
+      expect(updateData()).toMatchObject(backToReview);
+    });
+
+    it('keeps the badge for changes an admin did not verify', async () => {
+      await service.updateProfile('user-supplier-1', {
+        description: 'Now open on Sundays',
+        contactPhone: '+233201111111',
+        isAcceptingOrders: false,
+      });
+
+      expect(updateData()).not.toHaveProperty('verificationStatus');
+    });
+
+    it('keeps the badge when the same details are saved again', async () => {
+      await service.updateProfile('user-supplier-1', {
+        companyName: '  Energy Express Ltd ',
+        businessRegNumber: 'BN123456',
+        taxId: 'TIN-1',
+      });
+
+      expect(updateData()).not.toHaveProperty('verificationStatus');
+    });
+
+    it('leaves a depot that is not verified in its current state', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockProfile);
+
+      await service.updateProfile('user-supplier-1', { companyName: 'Renamed Ltd' });
+
+      expect(updateData()).not.toHaveProperty('verificationStatus');
+    });
+
+    it('applies the same rule when the full profile form is resubmitted', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({ ...mockUser, role: Role.SUPPLIER });
+
+      await service.createOrUpdateProfile('user-supplier-1', {
+        companyName: 'Energy Express Ltd',
+        businessRegNumber: 'BN123456',
+        taxId: 'TIN-CHANGED',
+        address: '10 Industrial Way',
+        city: 'Accra',
+        contactPhone: '+233200000000',
+        contactEmail: 'contact@energyexpress.com',
+      });
+
+      const args = mockPrisma.supplierProfile.upsert.mock.calls[0][0];
+      expect(args.update).toMatchObject(backToReview);
+      expect(args.create.verificationStatus).toBe(VerificationStatus.PENDING);
+    });
+
+    it('creates a first profile as pending without touching anything else', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(mockUser);
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(null);
+
+      await service.createOrUpdateProfile('user-supplier-1', {
+        companyName: 'Energy Express Ltd',
+        address: '10 Industrial Way',
+        city: 'Accra',
+        contactPhone: '+233200000000',
+        contactEmail: 'contact@energyexpress.com',
+      });
+
+      const args = mockPrisma.supplierProfile.upsert.mock.calls[0][0];
+      expect(args.update).not.toHaveProperty('verificationStatus');
     });
   });
 
@@ -175,7 +268,9 @@ describe('SuppliersService', () => {
   describe('configureDeliveryAreas', () => {
     it('should assign delivery areas when valid IDs are provided', async () => {
       mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockProfile);
-      mockPrisma.deliveryArea.count.mockResolvedValue(1);
+      mockPrisma.deliveryArea.findMany.mockResolvedValue([
+        { id: 'area-1', name: 'Area 1', isActive: true },
+      ]);
 
       await service.configureDeliveryAreas('user-supplier-1', [
         {
@@ -189,15 +284,106 @@ describe('SuppliersService', () => {
       expect(mockPrisma.supplierDeliveryArea.createMany).toHaveBeenCalled();
     });
 
+    /**
+     * The coverage page only lists active areas, so replacing everything would
+     * silently drop a supplier's coverage of a paused area on their next save.
+     */
+    it('should replace only coverage of active areas', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockProfile);
+      mockPrisma.deliveryArea.findMany.mockResolvedValue([
+        { id: 'area-1', name: 'Area 1', isActive: true },
+      ]);
+
+      await service.configureDeliveryAreas('user-supplier-1', [
+        { deliveryAreaId: 'area-1' },
+      ]);
+
+      expect(mockPrisma.supplierDeliveryArea.deleteMany).toHaveBeenCalledWith({
+        where: {
+          supplierProfileId: 'profile-1',
+          deliveryArea: { isActive: true },
+        },
+      });
+    });
+
+    it('should refuse to add a paused area without touching existing coverage', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockProfile);
+      mockPrisma.deliveryArea.findMany.mockResolvedValue([
+        { id: 'area-1', name: 'Paused Area', isActive: false },
+      ]);
+
+      await expect(
+        service.configureDeliveryAreas('user-supplier-1', [
+          { deliveryAreaId: 'area-1' },
+        ]),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(mockPrisma.supplierDeliveryArea.deleteMany).not.toHaveBeenCalled();
+      expect(mockPrisma.supplierDeliveryArea.createMany).not.toHaveBeenCalled();
+    });
+
     it('should throw NotFoundException if any delivery area ID is invalid', async () => {
       mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockProfile);
-      mockPrisma.deliveryArea.count.mockResolvedValue(0);
+      mockPrisma.deliveryArea.findMany.mockResolvedValue([]);
 
       await expect(
         service.configureDeliveryAreas('user-supplier-1', [
           { deliveryAreaId: 'invalid-area-id' },
         ]),
       ).rejects.toThrow(NotFoundException);
+    });
+
+    /** Previously reported as "invalid IDs"; a repeat is now named as one. */
+    it('should reject an area listed twice without touching existing coverage', async () => {
+      mockPrisma.supplierProfile.findUnique.mockResolvedValue(mockProfile);
+      mockPrisma.deliveryArea.findMany.mockResolvedValue([
+        { id: 'area-1', name: 'Area 1', isActive: true },
+      ]);
+
+      await expect(
+        service.configureDeliveryAreas('user-supplier-1', [
+          { deliveryAreaId: 'area-1' },
+          { deliveryAreaId: 'area-1', deliveryFee: 10 },
+        ]),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(mockPrisma.supplierDeliveryArea.deleteMany).not.toHaveBeenCalled();
+      expect(mockPrisma.supplierDeliveryArea.createMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('public supplier pages', () => {
+    const coverageSelect = (args: any) => args.select.deliveryAreas;
+
+    it('list only coverage in active areas', async () => {
+      mockPrisma.supplierProfile.findMany.mockResolvedValue([]);
+
+      await service.listPublicSuppliers();
+
+      expect(coverageSelect(mockPrisma.supplierProfile.findMany.mock.calls[0][0]).where).toEqual({
+        deliveryArea: { isActive: true },
+      });
+    });
+
+    it('never match a paused area when filtering by area', async () => {
+      mockPrisma.supplierProfile.findMany.mockResolvedValue([]);
+
+      await service.listPublicSuppliers(undefined, 'area-1');
+
+      expect(mockPrisma.supplierProfile.findMany.mock.calls[0][0].where.deliveryAreas).toEqual({
+        some: { deliveryAreaId: 'area-1', deliveryArea: { isActive: true } },
+      });
+    });
+
+    /** Checkout offers exactly these areas, so a paused one must not be among them. */
+    it('show a single supplier only with coverage in active areas', async () => {
+      mockPrisma.supplierProfile.findFirst.mockResolvedValue({ id: 'profile-1' });
+
+      await service.getPublicSupplierById('profile-1');
+
+      expect(coverageSelect(mockPrisma.supplierProfile.findFirst.mock.calls[0][0]).where).toEqual({
+        deliveryArea: { isActive: true },
+      });
     });
   });
 

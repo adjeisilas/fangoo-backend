@@ -16,6 +16,8 @@ export interface PaystackInitializeParams {
   currency: string;
   reference: string;
   callbackUrl: string;
+  /** Sent as metadata, so a payment can be matched to its order by any reference. */
+  orderId: string;
 }
 
 export interface PaystackInitializeResult {
@@ -41,6 +43,8 @@ export interface PaystackVerifyResult {
   currency: string;
   paidAt: string | null;
   gatewayResponse: string | null;
+  /** The order id sent at initialisation, or null for transactions without one. */
+  orderId: string | null;
 }
 
 /**
@@ -79,6 +83,7 @@ export class PaystackService {
       currency: params.currency,
       reference: params.reference,
       callback_url: params.callbackUrl,
+      metadata: JSON.stringify({ order_id: params.orderId }),
     };
 
     const response = await fetch(
@@ -137,6 +142,7 @@ export class PaystackService {
         currency: string;
         paid_at: string | null;
         gateway_response: string | null;
+        metadata?: unknown;
       };
     };
 
@@ -156,6 +162,7 @@ export class PaystackService {
       currency: payload.data.currency,
       paidAt: payload.data.paid_at,
       gatewayResponse: payload.data.gateway_response,
+      orderId: readOrderId(payload.data.metadata),
     };
   }
 
@@ -237,4 +244,23 @@ export class PaystackService {
   expectedMinorUnits(amount: string): number {
     return this.toMinorUnits(amount);
   }
+}
+
+/**
+ * Paystack returns metadata as an object, or as the JSON string it was sent as,
+ * depending on the endpoint. Anything unexpected reads as "no order id".
+ */
+export function readOrderId(metadata: unknown): string | null {
+  let value = metadata;
+
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  const orderId = (value as { order_id?: unknown } | null)?.order_id;
+  return typeof orderId === 'string' && orderId.length > 0 ? orderId : null;
 }
